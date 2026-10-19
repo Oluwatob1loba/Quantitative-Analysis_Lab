@@ -1,0 +1,1884 @@
+// This combined script merges two originally-separate personal indicators into one, to fit
+// within TradingView's free-tier indicator-per-chart limit.
+//
+// The "Sessions" section below (Sections 10-18) is adapted from "Sessions [LuxAlgo]",
+// (c) LuxAlgo, licensed under CC BY-NC-SA 4.0: https://creativecommons.org/licenses/by-nc-sa/4.0/
+// Its own calculation logic is unmodified; the only change is a timeframe-accuracy gate
+// (sessionsTimeframeOk) that replaces the >30min cutoff previously set via that indicator's own
+// Visibility tab, since one Visibility tab now covers this whole merged script and can't apply
+// to only half of it.
+//
+// The Market Structure (TF1/TF2) section, Sections 1-9, is original work.
+//
+// -----------------------------------------------------------------------------------------------
+// CORE PHILOSOPHY (Market Structure)
+//   TF1 (Macro Layer)     - the time & price bounding box. Anatomical levels (High/Low/Mid/Open)
+//                            of the previous N TF1 candles.
+//   TF2 (Structure Layer) - major swing highs/lows (strict 3-bar fractal, alternation-confirmed)
+//                            formed within a live, continuously-sliding time window -- either
+//                            derived from TF1's own lookback, or an independent manual lookback
+//                            (Section 1). Also carries the system-wide bias state machine
+//                            (CHoCH/BOS) and Critical Swing classification -- see Section 8.
+//   TF3 (Execution Layer) - explicitly: whatever timeframe the chart is CURRENTLY displaying
+//                            (timeframe.period). TF3 has no role in any structural calculation --
+//                            TF1 and TF2 invalidation are decided entirely by their own native
+//                            candle closes, independent of what TF3 you happen to be viewing.
+//                            TF3 has exactly two jobs: (1) the dynamic visibility gate -- a level
+//                            only renders if TF3 is at or below that level's own timeframe, since
+//                            plotting a Weekly level on a Monthly chart is meaningless -- and
+//                            (2) the drawing canvas, since every Pine drawing object has to be
+//                            projected onto some chart, and that's whichever TF3 you're on.
+//                            Nothing else about TF1/TF2's structure depends on it.
+//
+// INVALIDATION PRINCIPLE
+//   A level is invalidated strictly by a confirmed close on ITS OWN native timeframe -- a TF1
+//   level only by a TF1 candle's close, a TF2 level only by a TF2 candle's close. TF3 never
+//   participates in that decision. Letting a lower timeframe's close invalidate a higher
+//   timeframe's level is exactly the mechanism a liquidity sweep exploits: price wicks or closes
+//   through on a fast timeframe, the level dies, and the reversal back through it -- often the
+//   actual signal -- has nothing left to react against.
+//
+//   What DOES depend on TF3 is how precisely that already-decided invalidation gets drawn. The
+//   exact boundary timestamp of the native-timeframe candle that caused the break is stamped
+//   onto the level itself (Level.endTime) the instant invalidation is detected, and THAT stored
+//   timestamp -- not wherever the render loop happened to be extending the line to -- is what
+//   caps its x2. A level therefore looks identically, precisely terminated whether you view it on
+//   its own native timeframe or on something far lower (H4 under a Weekly TF1, say) -- on the
+//   lower timeframe the line simply won't reach all the way to the candle body that broke it
+//   there, because that candle was never what decided the break.
+//
+// COORDINATE SYSTEM
+//   Every drawing object uses xloc.bar_time (absolute UNIX-ms timestamps), never xloc.bar_index.
+//   A level can sit dozens of TF1/TF2 candles behind the current bar, and bar_index coordinates
+//   degrade once that distance gets large, or break outright when the chart timeframe changes
+//   (bar-count numbering is local to whichever timeframe is currently loaded; absolute time is
+//   not).
+//
+// TF2 MAJOR STRUCTURE, ALTERNATION & BIAS (added in this revision -- TAD V2.2 Sections 7 & 9)
+//   Raw 3-bar fractal pivots (ta.pivothigh/pivotlow) don't naturally alternate -- several highs
+//   can print in a row with no intervening low, and vice versa. A raw pivot only becomes
+//   confirmed TF2 Major Structure once the OPPOSITE type appears; until then it's a "pending"
+//   candidate that a more extreme same-type pivot can still supersede. Superseded pivots are
+//   never silently thrown away -- they're retained as Minor structure, in their own array, with
+//   their own invalidation lifecycle, structurally walled off from ever reaching the bias engine
+//   or Critical Swing test (both of which read ONLY the Major array). "More extreme" is judged
+//   by CLOSING price, not wick price: the wick still becomes the confirmed level's own stored
+//   price, since a level is only actually broken at its real extreme, but when two same-type
+//   wicks are competing for the pending slot, the one whose CLOSE was more decisive wins --
+//   deliberately not the raw Dow Theory closes-only reading, but a close-filtered wick level.
+//
+//   Because confirmation always requires the opposite type to appear, confirmed Major Structure
+//   strictly alternates High-Low-High-Low by construction -- which is what makes the Protected
+//   Swing (the swing immediately behind the most recent one) trivial to find: it's always just
+//   the second-to-last array entry, no search needed. Bias flips (CHoCH) only when a confirmed
+//   TF2 close breaks that specific Protected Swing; a break of the MOST RECENT swing in the
+//   SAME direction as prevailing bias is a BOS (continuation, bias unchanged) and needs no
+//   separate code at all -- it's already fully represented by that swing's own close-based
+//   invalidation.
+//
+//   Critical Swing status (a confirmed Major swing whose price exactly equals its one specific
+//   parent TF1 candle's own High or Low) is tested once, at the exact moment of confirmation, and
+//   is then permanent -- never re-evaluated, even if that parent TF1 candle later ages out of
+//   TF1's own tracked window.
+//
+// FILE MAP
+//   1. Inputs / UI Matrix        6. Visibility Gates
+//   2. Type Definition (UDT)     7. TF1 Engine
+//   3. Helper Functions          8. TF2 Engine (alternation, bias/CHoCH, Critical Swing)
+//   4. Data Fetching             9. Render Loop
+//   5. Persistent State
+// =============================================================================================
+
+//@version=6
+indicator("RIGEL NOIR", shorttitle = "RINO", overlay = true, max_bars_back = 500, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500)
+
+// =============================================================================================
+// SECTION 1 -- INPUTS / UI MATRIX (Market Structure)
+// =============================================================================================
+string layerEnableTooltip    = "Show or hide this layer's levels on the chart."
+string layerTimeframeTooltip = "The higher timeframe this layer's structure is calculated from."
+string lineWidthTooltip      = "Thickness of this layer's drawn levels, in pixels."
+
+tf1EnableInput    = input.bool(true, "Enable", group = "TF1 - Macro Layer", tooltip = layerEnableTooltip, inline = "tf1Main")
+tf1Input          = input.timeframe("1M", "Timeframe", group = "TF1 - Macro Layer", tooltip = layerTimeframeTooltip, inline = "tf1Main")
+lookbackInput     = input.int(4, "Lookback (candles)", minval = 1, maxval = 120, group = "TF1 - Macro Layer", tooltip = "How many of the most recent TF1 candles to keep levels for. V2.3: cap raised from 40 to 120 for backtesting depth. Budget note: each tracked candle costs 2 lines (3 with Show Open), and in Anchored mode TF2 inherits this span -- so very deep settings compete with TF2 and the dividers for Pine's hard 500-line ceiling. If the newest structure lines ever stop appearing, reduce this, switch TF2 to Manual anchor, or trim the divider lookback.")
+tf1SubLookbackInput    = input.int(3, "Sub-lookback (most recent, full opacity)", minval = 1, maxval = 120, group = "TF1 - Macro Layer", tooltip = "Candles within this many of the most recent stay at full opacity. Older candles, up to the main Lookback above, fade instead (see the shared Fade group). Automatically capped at whatever the main Lookback is currently set to. Cap raised to 120 in V2.3 to track the main lookback's new range.")
+tf1ShowOpenInput  = input.bool(false, "Show Open", group = "TF1 - Macro Layer", tooltip = "Include each candle's open price as a fourth, lower-priority level.", inline = "tf1Style")
+tf1MidLookbackInput  = input.int(1, "Mid lookback (candles)", minval = 1, maxval = 120, group = "TF1 - Macro Layer", tooltip = "V2.3 amendment (closes Appendix B4): 1 = the original isolated behaviour -- a single Mid for the currently-forming candle, replaced on every close. N > 1 retains the Midpoints of the N most recent closed TF1 candles as dashed lines, retired by window slide only -- Mids are never price-invalidated (TAD V2 Section 2). Budget note: each retained Mid is one line from the shared 500-line ceiling.")
+tf1OpenLookbackInput = input.int(0, "Open lookback (0 = follow main)", minval = 0, maxval = 120, group = "TF1 - Macro Layer", tooltip = "V2.3 amendment: 0 = Open levels retire together with the main High/Low window (original behaviour). N > 0 gives Open its own independent retirement window in TF1 candles, so opens can persist deeper (or shallower) than the macro box. Only meaningful while Show Open is on. Does NOT move the TF2 anchored window -- the anchor follows the main High/Low lookback only.")
+tf1LineWidthInput = input.int(1, "Width", minval = 1, maxval = 4, group = "TF1 - Macro Layer", tooltip = lineWidthTooltip, inline = "tf1Style")
+tf1HighColor      = input.color(#2962FF, "High", group = "TF1 - Macro Layer", inline = "tf1Colors1")
+tf1LowColor       = input.color(#FF6D00, "Low", group = "TF1 - Macro Layer", inline = "tf1Colors1")
+tf1NeutralColor   = input.color(#8D8D8D, "Neutral (Close = Open)", group = "TF1 - Macro Layer")
+tf1MidColor       = input.color(#787B86, "Mid", group = "TF1 - Macro Layer", inline = "tf1Colors2")
+tf1OpenColor      = input.color(#9598A1, "Open", group = "TF1 - Macro Layer", inline = "tf1Colors2")
+
+tf2EnableInput         = input.bool(true, "Enable", group = "TF2 - Structure Layer", tooltip = layerEnableTooltip, inline = "tf2Main")
+tf2Input               = input.timeframe("1W", "Timeframe", group = "TF2 - Structure Layer", tooltip = layerTimeframeTooltip, inline = "tf2Main")
+tf2AnchorToTf1Input    = input.bool(true, "Anchor to TF1 window", group = "TF2 - Structure Layer", tooltip = "Keep TF2 swings limited to the same time range TF1 currently covers. Turn off to set an independent lookback instead.", inline = "tf2Anchor")
+tf2ManualLookbackInput = input.int(10, "Manual lookback (candles)", minval = 1, maxval = 300, group = "TF2 - Structure Layer", tooltip = "Independent TF2 lookback in TF2's own candles. Only used when the anchor toggle above is off. V2.3: cap raised from 100 to 300 for backtesting depth. Budget note: roughly 0.8 drawn lines per TF2 candle in the window (Major + Minor swings), sharing the same hard 500-line ceiling as TF1 -- this is the lever to reach deep history WITHOUT inheriting TF1's full span, which is what makes deep backtests affordable.")
+tf2LineWidthInput      = input.int(1, "Width", minval = 1, maxval = 4, group = "TF2 - Structure Layer", tooltip = lineWidthTooltip)
+tf2ShowMinorInput      = input.bool(true, "Show Minor structure", group = "TF2 - Structure Layer", tooltip = "Superseded swing pivots -- retained for reference, but they never feed bias, CHoCH, or Critical Swing classification. Always rendered at the shared Fade opacity below, independent of the TF1 sub-lookback (Minor fades unconditionally, not by recency).")
+tf2CriticalEnableInput = input.bool(true, "Highlight Critical Swings", group = "TF2 - Structure Layer", tooltip = "A swing whose price matches its one parent TF1 candle's own High or Low. When off, all TF2 Major structure renders in the Regular color below.")
+criticalProximityPctInput = input.float(1.0, "Critical proximity (%)", minval = 0.0, step = 0.1, group = "TF2 - Structure Layer", tooltip = "How close a TF2 swing's price must be to its parent TF1 candle's High/Low to be classified as Critical, measured as a percentage of the TF1 level's price.\n\n0.0 = exact match only. 1.0 means the TF2 pivot must form within 1% of the TF1 candle's extreme. This percentage-based proximity test replaces the original tick-based tolerance, absorbing spread differences and timeframe aggregation mismatches so that valid structural alignments are reliably flagged regardless of the instrument's tick value.")
+criticalOnMinorInput   = input.bool(true, "Allow Critical on Minor swings", group = "TF2 - Structure Layer", tooltip = "Critical status was originally Major-only. But whether a price level IS its parent TF1 candle's extreme is a fact about price, independent of whether the TF2 alternation filter happened to promote that particular pivot to Major.\n\nON: a Minor swing sitting exactly on its TF1 parent's High/Low still gets the Critical color and marker -- catching genuine TF1 extremes that lost the Major slot to a rival pivot with a more decisive close.\n\nOFF: strictly the original Major-only behaviour.")
+tf2CriticalColor       = input.color(#c84a9a, "Critical", group = "TF2 - Structure Layer", inline = "tf2Colors")
+tf2MutedColor          = input.color(#a76f9e, "Regular", group = "TF2 - Structure Layer", inline = "tf2Colors")
+tf2MinorColor          = input.color(#a76f9e, "Minor", group = "TF2 - Structure Layer", inline = "tf2Colors", tooltip = "Minor's own color, independent of Regular above -- defaults to the same value so nothing changes visually until you pick a different one. Always shown at the shared Fade opacity below, never at full strength.")
+criticalMarkerSizeInput = input.string("Tiny", "Critical marker size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = "TF2 - Structure Layer", tooltip = "Size of the cross marker placed on Critical swings.")
+var criticalMarkerSize = switch criticalMarkerSizeInput
+    "Tiny"   => size.tiny
+    "Small"  => size.small
+    "Normal" => size.normal
+    "Large"  => size.large
+    "Huge"   => size.huge
+
+fadeOpacityInput = input.int(30, "Faded opacity %", minval = 0, maxval = 100, group = "Fade (Shared)", tooltip = "Shared by two unrelated fade cases: TF1 candles outside the sub-lookback window above, and all TF2 Minor structure (unconditionally, regardless of age). 100 = full strength, 0 = fully invisible. Applied as true transparency, not desaturation -- the chart shows through rather than the color shifting toward gray.")
+
+// =============================================================================================
+// SECTION 2 -- TYPE DEFINITION (UDT)
+// =============================================================================================
+type Level
+    line   id
+    float  price
+    int    startTime
+    int    endTime          // na while active; set to the exact native-close boundary timestamp
+                             // the instant invalidation is detected (Sections 7a/8a), so the line
+                             // renders correctly terminated on ANY TF3, not just its own native one.
+    string tf                // "TF1" or "TF2"
+    bool   isActive
+    string isHighLow         // "High" | "Low" | "Mid" | "Open" (TF1)   or   "High" | "Low" (TF2)
+    string polarity          // "resistance" | "support" -- unused/inert for Mid, see Section 7
+    bool   isCritical = false // TF2 Major only (TAD V2.2 Section 9). Set ONCE at confirmation,
+                              // permanent thereafter. Defaults false so every existing TF1
+                              // Level.new() call (Section 7, untouched by this revision) doesn't
+                              // need to mention this field at all -- it simply doesn't apply there.
+    bool   criticalTested = false // TF2 Major only. False means "not yet possible to test" (the
+                              // parent TF1 candle hadn't closed at confirmation time), NOT
+                              // "confirmed not critical" -- those are different things isCritical
+                              // alone can't distinguish. Section 7's retry step flips this to true
+                              // (resolving isCritical for good) the moment that parent closes.
+    string tf1Direction = "" // TF1 High/Low only (TAD V2.2 Section 8): "up" | "down" | "neutral",
+                              // set ONCE at spawn from that candle's own close-vs-open, driving
+                              // the per-candle color swap. Irrelevant for Mid, Open, and all of
+                              // TF2 -- left at its default "" for those, which f_lineColor treats
+                              // as "up" (the as-configured, non-inverted mapping).
+    label  markerId = na      // TF2 Critical swings only (TAD V2.2 Section 9.2). The small
+                              // circular marker's own drawing-object handle, kept on the Level so
+                              // it shares that Level's exact lifecycle -- created once alongside
+                              // the line, deleted only when the Level itself is pruned (Section 8c).
+
+// Used by Section 18's Period Dividers. Declared here, alongside Level, purely to keep both
+// user-defined types in one place -- it is not referenced until Section 18.
+type Divider
+    line  lineId
+    label labelId
+
+// =============================================================================================
+// SECTION 3 -- HELPER FUNCTIONS (Market Structure)
+// =============================================================================================
+f_lineStyle(kind) =>
+    kind == "Mid" ? line.style_dashed : kind == "Open" ? line.style_dotted : line.style_solid
+
+// Takes the whole Level so TF1's color can depend on tf1Direction (High/Low only, TAD V2.2
+// Section 8) and TF2's on isCritical -- neither piece of state applies outside its own timeframe,
+// which is exactly why both default to values that fall through to the "normal" mapping (empty
+// string reads as "up" below; isCritical = false routes to the shared Regular color). Handles TF1
+// and TF2 Major only -- Minor structure is colored directly in its own render-loop branch, since
+// it always fades unconditionally and never needs the Critical/Regular branch here.
+f_lineColor(lvl) =>
+    color result = na
+    if lvl.tf == "TF1"
+        if lvl.isHighLow == "High"
+            // Upclose (or the unset "" default): as-configured High color. Downclose: inverted --
+            // takes the Low color instead. Neutral: its own third color, overriding either side.
+            result := lvl.tf1Direction == "down" ? tf1LowColor : lvl.tf1Direction == "neutral" ? tf1NeutralColor : tf1HighColor
+        else if lvl.isHighLow == "Low"
+            result := lvl.tf1Direction == "down" ? tf1HighColor : lvl.tf1Direction == "neutral" ? tf1NeutralColor : tf1LowColor
+        else if lvl.isHighLow == "Mid"
+            result := tf1MidColor
+        else
+            result := tf1OpenColor
+    else
+        result := (tf2CriticalEnableInput and lvl.isCritical) ? tf2CriticalColor : tf2MutedColor
+    result
+
+// Applies the shared Fade opacity (TAD V2.2 Section 8 fade + TF2 Minor) as true transparency,
+// letting the chart show through, rather than shifting the color toward gray. Pine's own
+// color.new() transparency argument runs the opposite direction from "opacity" (0 = fully
+// visible, 100 = fully invisible), so this just flips the sign on the user-facing percentage.
+f_fadeColor(baseColor, opacityPct) =>
+    color.new(baseColor, 100 - opacityPct)
+// Deletes a Level's drawing objects and clears its handles so the same Level can be re-rendered
+// later from its stored stamps. Hiding in this system must be an explicit act -- "just stop
+// updating the line" leaves an orphaned object on the chart forever, which is exactly the class
+// of bug behind the "toggle off and the lines stay there" report. Used by Section 9's render
+// gates (out-of-window levels, closed visibility gates) and by the Minor/Critical toggles.
+// Deletes a Level's drawing objects and clears its handles so the same Level can be re-rendered
+// later from its stored stamps. Hiding in this system must be an explicit act -- "just stop
+// updating the line" leaves an orphaned object on the chart forever, which is exactly the class
+// of bug behind the "toggle off and the lines stay there" report. Used by Section 9's render
+// gates (out-of-window levels, closed visibility gates) and by the Minor/Critical toggles.
+// V2.3 fix (RE10041): the outer na() guard is mandatory, not defensive padding. A Level-typed
+// VARIABLE can itself be na (no object at all) -- tf1CurrentMid is exactly that on every bar
+// before the first TF1 close -- and touching ANY field of a na UDT reference is a runtime error,
+// not a silent no-op. This guard makes the helper safe to call with any Level handle, anywhere.
+f_hideLevel(lvl) =>
+    if not na(lvl)
+        if not na(lvl.id)
+            line.delete(lvl.id)
+            lvl.id := na
+        if not na(lvl.markerId)
+            label.delete(lvl.markerId)
+            lvl.markerId := na
+    true
+
+// =============================================================================================
+// SECTION 4 -- DATA FETCHING (non-repainting)
+// =============================================================================================
+[tf1O, tf1H, tf1L, tf1C, tf1T] = request.security(syminfo.tickerid, tf1Input, [open, high, low, close, time], lookahead = barmerge.lookahead_off)
+
+[tf2C, tf2T] = request.security(syminfo.tickerid, tf2Input, [close, time], lookahead = barmerge.lookahead_off)
+
+// gaps_on is critical here: without it, the one confirmed pivot value forward-fills across every
+// subsequent TF3 bar and looks like an unbroken stream of "new" pivots instead of a single event.
+// V2.3 revert to Option A (wick detects, wick compares): the close-based supersession contest
+// (Option B) was live-tested and rejected -- a wick-detected pivot list ranked by closes produced
+// a structure read that matched neither the wick chart nor the close chart, i.e. it inserted a
+// discretionary gap between what the eye sees and what the array holds. The wick is now both the
+// detector and the comparator, and remains the stored/rendered price: a future sweep still has to
+// reach the actual wick extreme to break the level.
+[tf2PivotHigh, tf2PivotLow, tf2PivotTime] = request.security(syminfo.tickerid, tf2Input, [ta.pivothigh(high, 1, 1), ta.pivotlow(low, 1, 1), time[1]], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_on)
+
+tf2ManualAnchorTime = request.security(syminfo.tickerid, tf2Input, time[tf2ManualLookbackInput], lookahead = barmerge.lookahead_on)
+
+// =============================================================================================
+// SECTION 5 -- PERSISTENT STATE (Market Structure)
+// =============================================================================================
+var array<Level> tf1Levels      = array.new<Level>()   // TF1 High/Low(/Open) levels, oldest-first
+var array<int>   tf1CandleTime  = array.new<int>()     // one UNIX timestamp per TF1 candle GROUP, oldest-first
+var array<Level> tf1MidLevels   = array.new<Level>()   // Midpoint levels, oldest-first (V2.3: array replaces the single tf1CurrentMid; size capped by tf1MidLookbackInput, 1 = original isolated behaviour)
+var array<Level> tf2Levels      = array.new<Level>()   // confirmed TF2 Major Structure swings, oldest-first --
+                                                         // strictly alternates High/Low by construction (Section 8)
+var array<Level> tf2MinorLevels = array.new<Level>()   // superseded TF2 pivots, retained but structurally
+                                                         // walled off from bias/CHoCH/Critical Swing (Section 8)
+
+// TF2 alternation filter's pending (unconfirmed) candidates -- at most one high-side and one
+// low-side candidate can exist at any time. A candidate is confirmed as Major the instant the
+// OPPOSITE type appears; it is superseded (and tagged Minor) the instant a more extreme same-type
+// pivot appears first. "More extreme" is judged wick-vs-wick (Option A, restored in V2.3): the
+// same price that gets stored and rendered is the price that wins the contest, so the array can
+// never disagree with the chart the user is looking at.
+var float pendingHighPrice = na
+var int   pendingHighTime  = na
+var float pendingLowPrice  = na
+var int   pendingLowTime   = na
+
+// System-wide bias state (TAD V2.2 Section 7.2): "undefined" until enough confirmed Major
+// structure exists to even evaluate a Protected Swing relationship, then bullish or bearish.
+var string bias = "undefined"
+
+// =============================================================================================
+// SECTION 6 -- DYNAMIC VISIBILITY GATES (Market Structure)
+// =============================================================================================
+showTf1 = tf1EnableInput and timeframe.in_seconds() <= timeframe.in_seconds(tf1Input)
+showTf2 = tf2EnableInput and timeframe.in_seconds() <= timeframe.in_seconds(tf2Input)
+
+// One TF2 candle's duration in milliseconds -- used by Section 9's render loop to centre Critical
+// markers over their parent candle rather than pinning them to its opening edge. Computed once
+// here rather than per-level in the loop, since it depends only on the configured timeframe.
+tf2DurationMs = timeframe.in_seconds(tf2Input) * 1000
+
+// Cross-timeframe bridge for Critical Swing classification (TAD V2.2 Section 9.1), needed by
+// both Section 7 (retry, below) and Section 8 (initial test) -- placed here, after tf1CandleTime/
+// tf1Levels are declared (Section 5) and before either section's own logic, since Pine resolves
+// identifiers top-to-bottom regardless of which numbered section surrounds them.
+//
+// Finds the ONE TF1 candle group whose time window contains a given timestamp, and returns
+// [resolved, High, Low]. Genuinely deferred, not just "not found": tf1T is the FIXED, already-
+// known opening time of whichever TF1 candle is CURRENTLY forming -- reading a timestamp boundary
+// live is safe, unlike reading a still-changing price. If originTime falls on or after that
+// boundary, its true parent is the candle currently forming, whose High/Low are not confirmed
+// values yet -- resolved comes back false, and the caller must wait rather than substitute the
+// nearest OLDER (and therefore wrong) already-closed candle. Only when originTime predates the
+// current candle's own start does the backward search below even run, at which point
+// tf1CandleTime being sorted oldest-first means the FIRST entry found searching backward that is
+// <= originTime is, by construction, the correct containing group.
+f_findParentTf1HighLow(originTime) =>
+    resolved = not na(tf1T) and originTime < tf1T
+    float foundHigh = na
+    float foundLow  = na
+    if resolved
+        float parentTime = na
+        i = array.size(tf1CandleTime) - 1
+        while i >= 0 and na(parentTime)
+            groupTime = array.get(tf1CandleTime, i)
+            if groupTime <= originTime
+                parentTime := groupTime
+            i -= 1
+        if not na(parentTime)
+            for lvl in tf1Levels
+                if lvl.startTime == parentTime
+                    if lvl.isHighLow == "High"
+                        foundHigh := lvl.price
+                    if lvl.isHighLow == "Low"
+                        foundLow := lvl.price
+    [resolved, foundHigh, foundLow]
+
+// Single place where a swing's Critical status is actually decided, so the tolerance rule can
+// never drift between the three call sites that need it (Major confirmation, Minor creation, and
+// Section 7e's deferred retry). Returns [resolved, isCritical] -- resolved = false means the
+// parent TF1 candle hasn't closed yet and the question is still open, which is a different thing
+// from a resolved "no" and is why criticalTested exists as its own field on the Level UDT.
+// Tolerance is expressed in the instrument's own ticks via syminfo.mintick, so the same setting
+// behaves sensibly whether the symbol prices in fractions of a pip or in thousands of dollars.
+f_testCritical(originTime, price, isHigh) =>
+    [resolved, parentHigh, parentLow] = f_findParentTf1HighLow(originTime)
+    parentPrice = isHigh ? parentHigh : parentLow
+    // V2.3: Proximity test. A TF2 swing is Critical if it forms within X% of its parent TF1 candle's High or Low.
+    // This percentage-based proximity test replaces the original tick-based tolerance, absorbing spread differences
+    // and timeframe aggregation mismatches so that valid structural alignments are reliably flagged regardless of
+    // the instrument's tick value. 1.0% is the default.
+    isCrit = false
+    if resolved and not na(parentPrice) and parentPrice != 0
+        pctDiff = math.abs(price - parentPrice) / parentPrice * 100.0
+        isCrit := pctDiff <= criticalProximityPctInput
+    [resolved, isCrit]
+
+// =============================================================================================
+// SECTION 7 -- TF1 ENGINE (Time & Price Anchor)
+// =============================================================================================
+newTf1Bar = tf1T != tf1T[1]
+
+if newTf1Bar and not na(tf1T[1])
+    closedO = tf1O[1]
+    closedH = tf1H[1]
+    closedL = tf1L[1]
+    closedC = tf1C[1]
+    closedT = tf1T[1]
+
+    // --- 7a. Invalidation: a confirmed CLOSE beyond the level, on TF1's OWN timeframe only --
+    // never TF3's. The endTime cap is tf1T[1], the BREAKING candle's own opening timestamp, not
+    // tf1T (the next candle's opening time = the breaking candle's END). Capping at the end would
+    // draw the line straight through the candle that broke it and stop only on its far side,
+    // visually overshooting the break; capping at the open stops the line cleanly at the breaking
+    // candle's left edge, leaving that candle fully visible to the right of the terminated line.
+    // If the line is already drawn, it's snapped to that cap immediately; if not (e.g. showTf1 was
+    // off at the time), Section 9 handles it on first draw.
+    for lvl in tf1Levels
+        if lvl.isActive
+            brokeUp   = closedC > lvl.price
+            brokeDown = closedC < lvl.price
+            if (lvl.polarity == "resistance" and brokeUp) or (lvl.polarity == "support" and brokeDown)
+                lvl.isActive := false
+                lvl.endTime := tf1T[1]
+                if not na(lvl.id)
+                    line.set_x2(lvl.id, lvl.endTime)
+
+    // --- 7b. Spawn High/Low(/Open) for the candle that just closed -- these are the levels that
+    // participate in the N-candle lookback window and get evicted together in 7c.
+    openPolarity = closedC > closedO ? "support" : "resistance"
+
+    // TAD V2.2 Section 8: this candle's own close-vs-open direction, stamped once onto its High
+    // and Low levels to drive the per-candle color swap. Deliberately NOT applied to Open --
+    // Open's own polarity above is already derived from this exact same comparison, so swapping
+    // its color on top of that would be circular; Open keeps its own independent tf1OpenColor,
+    // same as Mid keeps tf1MidColor, both entirely unaffected by this per-candle logic.
+    tf1CandleDirection = closedC > closedO ? "up" : closedC < closedO ? "down" : "neutral"
+
+    array.push(tf1Levels, Level.new(id = na, price = closedH, startTime = closedT, endTime = na, tf = "TF1", isActive = true, isHighLow = "High", polarity = "resistance", tf1Direction = tf1CandleDirection))
+    array.push(tf1Levels, Level.new(id = na, price = closedL, startTime = closedT, endTime = na, tf = "TF1", isActive = true, isHighLow = "Low", polarity = "support", tf1Direction = tf1CandleDirection))
+
+    if tf1ShowOpenInput
+        array.push(tf1Levels, Level.new(id = na, price = closedO, startTime = closedT, endTime = na, tf = "TF1", isActive = true, isHighLow = "Open", polarity = openPolarity))
+
+    array.push(tf1CandleTime, closedT)
+    
+
+    // --- 7e. Resolve deferred Critical Swing tests: this TF1 candle that just closed may be
+    // exactly the parent one or more pending TF2 swings were waiting on (Section 8b defers rather
+    // than tests against the wrong, still-open period). Runs generically over every untested
+    // swing, not just ones from the immediately-preceding period -- if something is still pending
+    // from further back for any reason, this same pass catches it too. Both arrays are swept:
+    // Minor swings carry the same Critical question as Major ones, since whether a price sits on
+    // its TF1 parent's extreme has nothing to do with which pivot won the alternation contest.
+    for lvl2c in tf2Levels
+        if not lvl2c.criticalTested
+            [resolvedC, isCritC] = f_testCritical(lvl2c.startTime, lvl2c.price, lvl2c.isHighLow == "High")
+            if resolvedC
+                lvl2c.isCritical := isCritC
+                lvl2c.criticalTested := true
+
+    for lvlMc in tf2MinorLevels
+        if not lvlMc.criticalTested
+            [resolvedMc, isCritMc] = f_testCritical(lvlMc.startTime, lvlMc.price, lvlMc.isHighLow == "High")
+            if resolvedMc
+                lvlMc.isCritical := isCritMc
+                lvlMc.criticalTested := true
+
+    // --- 7c. Per-type window eviction (V2.3 amendment) ---
+    // The old group-shift eviction assumed every candle contributed exactly the same 2-or-3
+    // levels, which made independent per-type lookbacks impossible. Eviction is now a front-loop
+    // against per-type startTime cutoffs: tf1CandleTime is sorted oldest-first, so the timestamp
+    // at position (size - N) is the oldest candle an N-candle window still retains, and any level
+    // whose own origin predates ITS type's cutoff is hidden and shifted out. The loop stops at the
+    // first survivor because the array is time-sorted. High/Low obey the main lookback; Open
+    // obeys its own window when set (0 or Show Open off = follow main); Mid is handled in 7d.
+    openKeepNow   = tf1ShowOpenInput and tf1OpenLookbackInput > 0 ? tf1OpenLookbackInput : lookbackInput
+    hlCutoffNow   = array.get(tf1CandleTime, math.max(array.size(tf1CandleTime) - lookbackInput, 0))
+    openCutoffNow = array.get(tf1CandleTime, math.max(array.size(tf1CandleTime) - openKeepNow, 0))
+    while array.size(tf1Levels) > 0
+        frontLvl = array.get(tf1Levels, 0)
+        frontCut = frontLvl.isHighLow == "Open" ? openCutoffNow : hlCutoffNow
+        if frontLvl.startTime < frontCut
+            f_hideLevel(frontLvl)
+            array.shift(tf1Levels)
+        else
+            break
+    // Trim the candle-time index to the widest window any level type still needs.
+    keepCandlesNow = math.max(lookbackInput, openKeepNow)
+    while array.size(tf1CandleTime) > keepCandlesNow
+        array.shift(tf1CandleTime)
+
+        // --- 7d. Midpoint array (V2.3 amendment) ---
+    // Mids stay outside tf1Levels and outside price-invalidation entirely (TAD V2 Section 2):
+    // window slide is the only thing that ever retires them. With the lookback at 1 this is
+    // exactly the old isolated behaviour; above 1, older Mids persist as dashed lines until the
+    // window slides past them. f_hideLevel on eviction keeps the stamps/handles discipline: the
+    // Level leaves the array and its line dies with it, nothing orphaned.
+    array.push(tf1MidLevels, Level.new(id = na, price = (closedH + closedL) / 2.0, startTime = closedT, endTime = na, tf = "TF1", isActive = true, isHighLow = "Mid", polarity = "support"))
+    while array.size(tf1MidLevels) > tf1MidLookbackInput
+        oldMid = array.shift(tf1MidLevels)
+        f_hideLevel(oldMid)
+
+// =============================================================================================
+// SECTION 8 -- TF2 ENGINE (Major Structure: Alternation, Bias/CHoCH, Critical Swing)
+// =============================================================================================
+// 8a. A TF2 candle closes  -> test every active TF2 Major AND Minor level for invalidation, on
+//     TF2's OWN confirmed close only -- same mechanics as 7a. Immediately after Major
+//     invalidation, checks whether the swing that just broke was the current Protected Swing --
+//     if so, this is a CHoCH and bias flips (TAD V2.2 Section 7.2). A BOS (the MOST RECENT swing
+//     breaking, same direction as prevailing bias) needs no separate code at all: it's already
+//     fully represented by that swing's own isActive flip in the loop below, at a different array
+//     index than the Protected Swing, so bias correctly stays put.
+// 8b. A raw TF2 pivot fires -> alternation filter (TAD V2.2 Section 7.1): tracks at most one
+//     pending (unconfirmed) candidate per side. A same-type pivot either supersedes the pending
+//     candidate (the older one retained as Minor) or is itself immediately Minor -- decided by
+//     comparing CLOSING prices, not wick prices (Option B). The wick still sets the level's own
+//     stored/rendered price either way, since a level is only ever actually broken at its real
+//     extreme; the close only decides which of two competing wicks was the more decisive move.
+//     An opposite-type pivot confirms whatever was pending on the OTHER side as Major Structure;
+//     Critical Swing status (TAD V2.2 Section 9.1) is evaluated once, right here, at that exact
+//     moment, and is permanent from then on.
+// 8c. Every bar -> prune any TF2 Major or Minor level whose own start time has fallen behind the
+//     anchor window, mirroring 7c.
+newTf2Bar = tf2T != tf2T[1]
+
+if newTf2Bar and not na(tf2T[1])
+    closed2C = tf2C[1]
+
+    // Capture the CURRENT Protected Swing's active/inactive state BEFORE this bar's invalidation
+    // pass runs, so a CHoCH is detected on the EXACT bar it happens, rather than re-triggering on
+    // every later bar just because that swing is already broken. Alternation guarantees confirmed
+    // Major Structure strictly alternates High/Low, so the entry immediately before the most
+    // recent confirmed swing is, by construction, always the opposite type -- no search needed,
+    // just the last two array entries.
+    n2 = array.size(tf2Levels)
+    protectedIdx = n2 >= 2 ? n2 - 2 : na
+    wasProtectedActive = not na(protectedIdx) ? array.get(tf2Levels, protectedIdx).isActive : false
+
+    for lvl2 in tf2Levels
+        if lvl2.isActive
+            brokeUp2   = closed2C > lvl2.price
+            brokeDown2 = closed2C < lvl2.price
+            if (lvl2.polarity == "resistance" and brokeUp2) or (lvl2.polarity == "support" and brokeDown2)
+                lvl2.isActive := false
+                lvl2.endTime := tf2T[1]
+                if not na(lvl2.id)
+                    line.set_x2(lvl2.id, lvl2.endTime)
+
+    // Minor levels get the identical close-based invalidation treatment, entirely independent of
+    // Major above -- Minor never feeds bias/CHoCH, but a broken Minor line shouldn't linger drawn
+    // looking live once price has actually closed through it.
+    for lvlM in tf2MinorLevels
+        if lvlM.isActive
+            brokeUpM   = closed2C > lvlM.price
+            brokeDownM = closed2C < lvlM.price
+            if (lvlM.polarity == "resistance" and brokeUpM) or (lvlM.polarity == "support" and brokeDownM)
+                lvlM.isActive := false
+                lvlM.endTime := tf2T[1]
+                if not na(lvlM.id)
+                    line.set_x2(lvlM.id, lvlM.endTime)
+
+    // CHoCH: the Protected Swing was active a moment ago and is now broken -- flip bias. This is
+    // a SEPARATE, system-wide state change from that level's own isActive flip above; the two
+    // occur on the same candle close but are not the same mechanism (TAD V2.2 Section 7.2).
+    if not na(protectedIdx) and wasProtectedActive
+        protectedSwing = array.get(tf2Levels, protectedIdx)
+        if not protectedSwing.isActive
+            if bias == "bullish" and protectedSwing.isHighLow == "Low"
+                bias := "bearish"
+            else if bias == "bearish" and protectedSwing.isHighLow == "High"
+                bias := "bullish"
+
+// Effective anchor: either TF1's own oldest-tracked-candle time, or an independent manual window.
+// V2.3: the anchor follows the MAIN High/Low window explicitly, not whatever the candle-time
+// index happens to retain -- an independent Open lookback deeper than the main window must not
+// silently widen the TF2 anchored structure window.
+tf1WindowAnchor = array.size(tf1CandleTime) > 0 ? array.get(tf1CandleTime, math.max(array.size(tf1CandleTime) - lookbackInput, 0)) : na
+tf2AnchorTime   = tf2AnchorToTf1Input ? tf1WindowAnchor : tf2ManualAnchorTime
+
+// --- 8b. Alternation filter + Critical Swing classification ---
+// V2.3: the pivotInWindow CREATION gate is gone. Pivots are one-time events; filtering them at
+// creation meant any pivot that fired while a NARROW anchor was active was never recorded at all,
+// so re-widening the anchor later could not bring its structure back. Pivots are now recorded
+// unconditionally (bounded by the memory horizon in 8c) and the anchor window is enforced at
+// RENDER time in Section 9 instead -- which is what makes the anchor toggle reversible both ways.
+newPivotHigh  = not na(tf2PivotHigh) and na(tf2PivotHigh[1])
+newPivotLow   = not na(tf2PivotLow) and na(tf2PivotLow[1])
+
+if newPivotHigh
+    if na(pendingHighPrice) or tf2PivotHigh > pendingHighPrice
+        // This pivot becomes (or remains) the pending candidate. Whatever was pending before, if
+        // anything, has just been superseded -- tag it Minor and retain it, never discard it.
+        // It still gets Critical-tested on the way out: losing the alternation contest says
+        // nothing about whether its price happens to be its parent TF1 candle's own extreme.
+        if not na(pendingHighPrice)
+            [resSupH, critSupH] = f_testCritical(pendingHighTime, pendingHighPrice, true)
+            array.push(tf2MinorLevels, Level.new(id = na, price = pendingHighPrice, startTime = pendingHighTime, endTime = na, tf = "TF2", isActive = true, isHighLow = "High", polarity = "resistance", isCritical = critSupH, criticalTested = resSupH))
+        pendingHighPrice := tf2PivotHigh
+        pendingHighTime  := tf2PivotTime
+    else
+        // Less extreme (by wick) than the current pending candidate -- it never had a chance to
+        // lead, so it's Minor immediately, and the pending candidate above is left untouched.
+        [resLoseH, critLoseH] = f_testCritical(tf2PivotTime, tf2PivotHigh, true)
+        array.push(tf2MinorLevels, Level.new(id = na, price = tf2PivotHigh, startTime = tf2PivotTime, endTime = na, tf = "TF2", isActive = true, isHighLow = "High", polarity = "resistance", isCritical = critLoseH, criticalTested = resLoseH))
+
+if newPivotLow
+    if na(pendingLowPrice) or tf2PivotLow < pendingLowPrice
+        if not na(pendingLowPrice)
+            [resSupL, critSupL] = f_testCritical(pendingLowTime, pendingLowPrice, false)
+            array.push(tf2MinorLevels, Level.new(id = na, price = pendingLowPrice, startTime = pendingLowTime, endTime = na, tf = "TF2", isActive = true, isHighLow = "Low", polarity = "support", isCritical = critSupL, criticalTested = resSupL))
+        pendingLowPrice := tf2PivotLow
+        pendingLowTime  := tf2PivotTime
+    else
+        [resLoseL, critLoseL] = f_testCritical(tf2PivotTime, tf2PivotLow, false)
+        array.push(tf2MinorLevels, Level.new(id = na, price = tf2PivotLow, startTime = tf2PivotTime, endTime = na, tf = "TF2", isActive = true, isHighLow = "Low", polarity = "support", isCritical = critLoseL, criticalTested = resLoseL))
+
+// Confirmation: whichever side just got a NEW pivot of the OPPOSITE type confirms whatever was
+// pending on ITS OWN side as Major Structure -- alternation, by definition, means "the opposite
+// type just appeared", regardless of whether that new opposite-type pivot itself goes on to
+// become the new pending candidate, or is itself immediately superseded/Minor (both handled,
+// independently, above). Runs after both branches so a same-bar simultaneous high+low resolves.
+if newPivotLow and not na(pendingHighPrice)
+    [resolvedA, isCriticalHigh] = f_testCritical(pendingHighTime, pendingHighPrice, true)
+    array.push(tf2Levels, Level.new(id = na, price = pendingHighPrice, startTime = pendingHighTime, endTime = na, tf = "TF2", isActive = true, isHighLow = "High", polarity = "resistance", isCritical = isCriticalHigh, criticalTested = resolvedA))
+    // Bootstrap: TAD V2.2 Section 7.2 only specifies the bullish<->bearish CHoCH transitions, not
+    // how bias FIRST leaves "undefined". Once at least 2 confirmed Major swings exist, bias takes
+    // its first value from that pair's own direction: Low-then-High (this branch) reads bullish.
+    if bias == "undefined" and array.size(tf2Levels) >= 2
+        bias := "bullish"
+    pendingHighPrice := na
+    pendingHighTime  := na
+
+if newPivotHigh and not na(pendingLowPrice)
+    [resolvedB, isCriticalLow] = f_testCritical(pendingLowTime, pendingLowPrice, false)
+    array.push(tf2Levels, Level.new(id = na, price = pendingLowPrice, startTime = pendingLowTime, endTime = na, tf = "TF2", isActive = true, isHighLow = "Low", polarity = "support", isCritical = isCriticalLow, criticalTested = resolvedB))
+    // Mirror bootstrap: High-then-Low reads as bearish.
+    if bias == "undefined" and array.size(tf2Levels) >= 2
+        bias := "bearish"
+    pendingLowPrice := na
+    pendingLowTime  := na
+
+// --- 8c. Two-tier lifetime: MEMORY horizon (here) vs RENDER window (Section 9) ---
+// Tier 2 (memory, this block): a Level leaves the array for good only once its origin falls
+// behind the EARLIEST anchor the user could switch to right now -- the older of the TF1 window
+// and the manual window. Tier 1 (render, Section 9): levels outside the CURRENT anchor window are
+// hidden (objects deleted, handles cleared) but RETAINED in the array.
+// Why two tiers: the old code deleted Levels the moment they left the current window. Because a
+// pivot event is one-time, that made the anchor toggle destructive -- narrow the window and every
+// swing outside it was forgotten forever; widen it again and the chart came back empty until new
+// pivots slowly re-formed. Hiding instead of forgetting makes the toggle fully reversible in both
+// directions while memory stays bounded by whichever of the two anchor inputs is wider.
+memoryHorizon = math.min(nz(tf1WindowAnchor, nz(tf2ManualAnchorTime, time)), nz(tf2ManualAnchorTime, nz(tf1WindowAnchor, time)))
+
+if not na(memoryHorizon)
+    i2 = array.size(tf2Levels) - 1
+    while i2 >= 0
+        lvl2p = array.get(tf2Levels, i2)
+        if lvl2p.startTime < memoryHorizon
+            f_hideLevel(lvl2p)
+            array.remove(tf2Levels, i2)
+        i2 -= 1
+
+    iM = array.size(tf2MinorLevels) - 1
+    while iM >= 0
+        lvlMp = array.get(tf2MinorLevels, iM)
+        if lvlMp.startTime < memoryHorizon
+            f_hideLevel(lvlMp)
+            array.remove(tf2MinorLevels, iM)
+        iM -= 1
+
+// =============================================================================================
+// SECTION 9 -- RENDER LOOP (Market Structure)
+// =============================================================================================
+// A level not yet drawn (id == na) is created now: if it's still active, it's drawn live,
+// extending to the current bar's time like normal; if it's ALREADY inactive by the time it first
+// gets drawn (e.g. it was invalidated while showTf1/showTf2 was off), it's drawn already
+// terminated at its stored endTime instead of starting live and needing a later correction.
+// A level that's already drawn and still active keeps extending to "now" every bar. A level
+// that's already drawn and already inactive needs nothing further here -- it was already snapped
+// to its exact endTime the instant invalidation was detected (Sections 7a/8a).
+
+// Sub-lookback fade cutoff (TAD V2.2 Section 8): recomputed every bar since the window slides
+// forward as new TF1 candles close. tf1CandleTime is sorted oldest-first, so the timestamp
+// exactly tf1SubLookbackEff positions from the end marks the boundary -- anything at or after it
+// is "recent" (full opacity), anything before it fades. Clamped to lookbackInput so sub-lookback
+// can never exceed however many candles are actually being tracked right now.
+tf1SubLookbackEff = math.min(tf1SubLookbackInput, lookbackInput)
+tf1SubLookbackCutoff = array.size(tf1CandleTime) > 0 ? array.get(tf1CandleTime, math.max(array.size(tf1CandleTime) - tf1SubLookbackEff, 0)) : na
+
+// Visibility-gate cleanup (V2.3): when the chart timeframe rises ABOVE a layer's own timeframe,
+// that layer's gate closes -- and its already-drawn objects must be explicitly deleted, not
+// abandoned. Previously the render loop simply stopped running, leaving every TF1/TF2 line and
+// marker orphaned on the chart at exactly the moment the gate said they should not be visible.
+if not showTf1
+    for lvlHide1 in tf1Levels
+        f_hideLevel(lvlHide1)
+    for midHide in tf1MidLevels
+        f_hideLevel(midHide)
+
+if not showTf2
+    for lvlHide2 in tf2Levels
+        f_hideLevel(lvlHide2)
+    for lvlHide3 in tf2MinorLevels
+        f_hideLevel(lvlHide3)
+
+if showTf1
+    for lvl in tf1Levels
+        baseColor = f_lineColor(lvl)
+        // Faded, not the as-configured color, once this level's own candle has aged past the
+        // sub-lookback window. Re-evaluated every bar regardless of isActive -- an already-broken
+        // level can still visibly transition from full opacity to faded as the window slides past
+        // it, since fade is about RECENCY, not about whether the level is still live.
+        renderColor = (not na(tf1SubLookbackCutoff) and lvl.startTime < tf1SubLookbackCutoff) ? f_fadeColor(baseColor, fadeOpacityInput) : baseColor
+        if na(lvl.id)
+            endpoint = lvl.isActive ? time : lvl.endTime
+            lvl.id := line.new(x1 = lvl.startTime, y1 = lvl.price, x2 = endpoint, y2 = lvl.price, xloc = xloc.bar_time, extend = extend.none, color = renderColor, style = f_lineStyle(lvl.isHighLow), width = tf1LineWidthInput)
+        else
+            line.set_color(lvl.id, renderColor)
+            if lvl.isActive
+                line.set_x2(lvl.id, time)
+
+    // Midpoint levels (V2.3 amendment): rendered from the Mid array, oldest-first, live-extending
+    // to "now" exactly like the old single instance. Deliberately excluded from the fade check:
+    // Mids are already a secondary annotation layer, and fading them on top of their own lookback
+    // window would double-penalize age. With the lookback at 1 this draws exactly one line.
+    for midLvl in tf1MidLevels
+        if na(midLvl.id)
+            midLvl.id := line.new(x1 = midLvl.startTime, y1 = midLvl.price, x2 = time, y2 = midLvl.price, xloc = xloc.bar_time, extend = extend.none, color = f_lineColor(midLvl), style = f_lineStyle(midLvl.isHighLow), width = tf1LineWidthInput)
+        else
+            line.set_x2(midLvl.id, time)
+
+if showTf2
+    for lvl2 in tf2Levels
+        // Render gate (V2.3, lifetime tier 1): a Major level whose origin has slid behind the
+        // CURRENT anchor window is hidden, not forgotten -- f_hideLevel deletes its drawing
+        // objects and clears the handles, while the Level itself stays in the array so that
+        // re-widening the window (or flipping the anchor toggle back) redraws it instantly from
+        // its stored stamps. This is what makes the anchor toggle reversible: a pivot is a
+        // one-time event, so a Level deleted here could never be re-created later.
+        if lvl2.startTime < tf2AnchorTime
+            f_hideLevel(lvl2)
+            continue
+        if na(lvl2.id)
+            endpoint2 = lvl2.isActive ? time : lvl2.endTime
+            lvl2.id := line.new(x1 = lvl2.startTime, y1 = lvl2.price, x2 = endpoint2, y2 = lvl2.price, xloc = xloc.bar_time, extend = extend.none, color = f_lineColor(lvl2), style = line.style_solid, width = tf2LineWidthInput)
+        else
+            // Colour is refreshed every bar, not only at creation, so flipping "Highlight Critical
+            // Swings" later re-colours lines that already exist instead of leaving a stale mix of
+            // old and new colours on the chart.
+            line.set_color(lvl2.id, f_lineColor(lvl2))
+            if lvl2.isActive
+                line.set_x2(lvl2.id, time)
+
+        // Critical Swing marker (TAD V2.2 Section 9.2 -- exception explicitly granted to the
+        // no-labels rule for this one case, since it carries no text/name, only a shape).
+        // A small filled circle per TAD V2.2 Section 9.2's original specification, positioned
+        // immediately above/below the swing. Kept at the user-configured size input, defaulting
+        // to Tiny so the dot reads as "this exact point" without adding pixel mass to the swing.
+        //
+        // Positioned at the CENTRE of its TF2 candle's own time span, not at startTime. startTime
+        // is that candle's opening edge, which on TF2 itself is barely distinguishable from its
+        // centre -- but viewed from a much lower TF3, a single Weekly candle spans dozens of bars,
+        // and pinning the marker to its left edge makes it look badly offset from the swing it
+        // belongs to. Adding half the TF2 candle duration puts it over the middle of the parent
+        // candle at every zoom level.
+        //
+        // Created once, the moment isCritical is true, independent of the toggle -- but its COLOUR
+        // responds to the toggle every bar, exactly like the line's own colour does via
+        // f_lineColor, so turning the toggle off actually hides it rather than leaving a stale
+        // marker with no matching line.
+        // Critical Swing marker (TAD V2.2 Section 9.2): a small circular label stamped at the
+        // swing's own past timestamp. V2.3 revert from plotshape: labels are the ONLY Pine
+        // mechanism that can place a marker on a historical bar after the fact. Critical status
+        // is confirmed bars after the swing's origin (pivot right-bar confirmation, then the
+        // alternation filter, then possibly the deferred TF1 retry), so a plotshape emission
+        // window -- which only ever sees the bar being computed right now -- can never catch it.
+        if lvl2.isCritical
+            markerColor = tf2CriticalEnableInput ? tf2CriticalColor : color.new(tf2CriticalColor, 100)
+            if na(lvl2.markerId)
+                markerOffset = lvl2.price * 0.0015
+                markerY = lvl2.isHighLow == "High" ? lvl2.price + markerOffset : lvl2.price - markerOffset
+                markerX = int(lvl2.startTime + tf2DurationMs / 2)
+                lvl2.markerId := label.new(x = markerX, y = markerY, text = "", xloc = xloc.bar_time, yloc = yloc.price, style = label.style_circle, color = markerColor, size = criticalMarkerSize)
+            else
+                label.set_color(lvl2.markerId, markerColor)
+
+    // Minor structure has its own colour (tf2MinorColor), independent of Regular, always shown at
+    // the shared Fade opacity -- unconditionally, not gated by TF1's sub-lookback recency check,
+    // since Minor fades because of WHAT it is (superseded structure), not because of its age.
+    //
+    // The one exception is a Critical Minor swing: when criticalOnMinorInput is on, a Minor swing
+    // that sits on its parent TF1 candle's own extreme is promoted to the full Critical colour and
+    // gets the same marker as a Critical Major swing. It lost the alternation contest, but the
+    // price level it marks is still a TF1 extreme, and that is what Critical is actually about.
+    //
+    // V2.3 structure-agnostic rule: that Critical marker is NOT gated by Show Minor. Whether a
+    // price sits on its parent TF1 candle's extreme is a fact about price, independent of which
+    // pivot won the alternation contest and independent of whether superseded structure is
+    // currently being drawn at all -- so the marker survives Show Minor being switched off, while
+    // the plain Minor line still obeys the toggle.
+    //
+    // Hiding is explicit in both directions (V2.3): switching a draw flag off deletes the objects
+    // immediately instead of abandoning them mid-chart -- the old "just stop updating" behaviour
+    // is what left orphaned lines on the chart forever and flooded them back in on re-enable --
+    // and switching the flag back on redraws from the stored stamps, no reconstruction needed.
+    for lvlM2 in tf2MinorLevels
+        inWindowM       = lvlM2.startTime >= tf2AnchorTime
+        minorIsCrit     = criticalOnMinorInput and tf2CriticalEnableInput and lvlM2.isCritical
+        drawMinorLine   = tf2ShowMinorInput and inWindowM
+        drawMinorMarker = minorIsCrit and inWindowM
+
+        if not drawMinorLine and not na(lvlM2.id)
+            line.delete(lvlM2.id)
+            lvlM2.id := na
+        if not inWindowM and not na(lvlM2.markerId)
+            label.delete(lvlM2.markerId)
+            lvlM2.markerId := na
+
+        if drawMinorLine
+            // Critical Minor renders at full Critical colour; everything else Minor renders in
+            // Minor's own colour at the shared Fade opacity -- unconditionally, not gated by TF1's
+            // sub-lookback recency check, since Minor fades because of WHAT it is (superseded
+            // structure), not because of its age.
+            thisMinorColor = minorIsCrit ? tf2CriticalColor : f_fadeColor(tf2MinorColor, fadeOpacityInput)
+            if na(lvlM2.id)
+                endpointM2 = lvlM2.isActive ? time : lvlM2.endTime
+                lvlM2.id := line.new(x1 = lvlM2.startTime, y1 = lvlM2.price, x2 = endpointM2, y2 = lvlM2.price, xloc = xloc.bar_time, extend = extend.none, color = thisMinorColor, style = line.style_solid, width = tf2LineWidthInput)
+            else
+                line.set_color(lvlM2.id, thisMinorColor)
+                if lvlM2.isActive
+                    line.set_x2(lvlM2.id, time)
+
+        // Critical Minor marker: structure-agnostic (survives Show Minor being off, per the V2.3
+        // rule), stamped as a label at the swing's own past timestamp for the same reason as Major.
+        if drawMinorMarker
+            if na(lvlM2.markerId)
+                minorOffset = lvlM2.price * 0.0015
+                minorMarkerY = lvlM2.isHighLow == "High" ? lvlM2.price + minorOffset : lvlM2.price - minorOffset
+                minorMarkerX = int(lvlM2.startTime + tf2DurationMs / 2)
+                lvlM2.markerId := label.new(x = minorMarkerX, y = minorMarkerY, text = "", xloc = xloc.bar_time, yloc = yloc.price, style = label.style_circle, color = tf2CriticalColor, size = criticalMarkerSize)
+            else
+                label.set_color(lvlM2.markerId, tf2CriticalColor)
+        else if not na(lvlM2.markerId)
+            // Reclassified or toggle changed: hide via full transparency rather than deleting, so
+            // the marker returns instantly if the condition flips back without a rebuild.
+            label.set_color(lvlM2.markerId, color.new(tf2CriticalColor, 100))
+
+// =============================================================================================
+// SECTION 9B -- MOVING AVERAGE OVERLAYS (implements TAD V2.2 Section 10)
+// =============================================================================================
+// Labeled 9B rather than "Section 10" to avoid renumbering the Sessions module immediately below,
+// whose own internal numbering (10-18) predates this revision and is left untouched throughout.
+// Entirely independent of the TF1/TF2/TF3 Market Structure engine above and the Sessions module
+// below -- no interaction with, and no authority over, structure, bias, or invalidation. Both
+// overlays anchor to a higher timeframe than whatever the chart currently displays, using the
+// same anchor-independent-of-displayed-timeframe request.security pull already used for TF1 and
+// TF2 (Section 4), so a Weekly EMA stays computed from Weekly closes even while viewing a 4-hour
+// chart, rather than silently degrading into a same-timeframe plot. Continuously-recomputed
+// plotted lines, not discrete Level-UDT drawing objects -- no startTime/endTime, no pruning
+// needed (TAD V2.2 Section 10.3's own Bounded Lifetime note: plot() manages its own redraw every
+// bar without manual object lifecycle work).
+maEnableInput  = input.bool(true, "Enable", group = "MA Overlays", tooltip = "Show or hide all three overlays below.")
+maSmoothInput  = input.bool(true, "Smooth (scale length to chart timeframe)", group = "MA Overlays", tooltip = "ON (default): the MA is computed on the CHART's own candles using a proportionally scaled length, producing a continuous line. A Weekly 9 EMA viewed on a Daily chart becomes roughly a 63-period Daily EMA (9 x 7 calendar days) -- visually smooth, and very close to the true Weekly line, but not mathematically identical to it.\n\nOFF: the true anchor-timeframe MA, pulled as-is. Mathematically exact, but updates only once per anchor candle, so it renders as visible steps on any lower chart timeframe.")
+emaAnchorInput = input.timeframe("1W", "EMA anchor timeframe", group = "MA Overlays", tooltip = "Shared by both EMA lines below -- TAD V2.2 Section 10.1 flags a single shared anchor for the pair as its own working assumption, not explicitly confirmed in the source spec.")
+ema1LenInput   = input.int(9, "Length", minval = 1, group = "MA Overlays", inline = "ema1")
+ema1SrcInput   = input.source(close, "Source", group = "MA Overlays", inline = "ema1")
+ema1Color      = input.color(#2962FF, "Color", group = "MA Overlays", inline = "ema1")
+ema2LenInput   = input.int(18, "Length", minval = 1, group = "MA Overlays", inline = "ema2")
+ema2SrcInput   = input.source(close, "Source", group = "MA Overlays", inline = "ema2")
+ema2Color      = input.color(#FF6D00, "Color", group = "MA Overlays", inline = "ema2")
+smaAnchorInput = input.timeframe("1D", "SMA anchor timeframe", group = "MA Overlays")
+smaLenInput    = input.int(200, "Length", minval = 1, group = "MA Overlays", inline = "sma1")
+smaSrcInput    = input.source(close, "Source", group = "MA Overlays", inline = "sma1")
+smaColor       = input.color(#787B86, "Color", group = "MA Overlays", inline = "sma1")
+
+// Visibility gate, mirroring Section 6's own rule for TF1/TF2: an overlay only renders if the
+// chart is at or below its anchor timeframe. A Weekly EMA on a Monthly chart would be pulling
+// finer-grained data than the chart itself displays, which is meaningless -- so it's hidden
+// rather than drawn misleadingly. Each overlay is gated against its OWN anchor independently,
+// so the Daily SMA can hide while the Weekly EMAs stay visible, or vice versa.
+showEmaOverlay = maEnableInput and timeframe.in_seconds() <= timeframe.in_seconds(emaAnchorInput)
+showSmaOverlay = maEnableInput and timeframe.in_seconds() <= timeframe.in_seconds(smaAnchorInput)
+
+// Scale factor for Smooth mode: how many chart candles fit inside one anchor candle. Floored at
+// 1 so that when chart and anchor timeframes match (or the chart is somehow higher), the length
+// passes through unscaled rather than collapsing toward zero.
+emaScale = math.max(int(math.round(timeframe.in_seconds(emaAnchorInput) / timeframe.in_seconds())), 1)
+smaScale = math.max(int(math.round(timeframe.in_seconds(smaAnchorInput) / timeframe.in_seconds())), 1)
+
+// Both variants are computed unconditionally, then selected between -- request.security cannot be
+// called from inside a conditional block in Pine, so branching has to happen at the value, not at
+// the call.
+ema1Stepped = request.security(syminfo.tickerid, emaAnchorInput, ta.ema(ema1SrcInput, ema1LenInput), lookahead = barmerge.lookahead_off)
+ema2Stepped = request.security(syminfo.tickerid, emaAnchorInput, ta.ema(ema2SrcInput, ema2LenInput), lookahead = barmerge.lookahead_off)
+smaStepped  = request.security(syminfo.tickerid, smaAnchorInput, ta.sma(smaSrcInput, smaLenInput), lookahead = barmerge.lookahead_off)
+
+// V2.3 fix (RE10004): Pine's rolling functions may reference at most 5000 historical candles.
+// Smooth mode scales the anchor length by the chart-to-anchor ratio, so on low chart timeframes
+// the product blows past that ceiling (Weekly 18 on a 30m chart = 18 x 336 = 6048 -> RE10004 on
+// bar 0, exactly when the chart is first replayed at <=30m). The cap keeps the script alive at
+// every timeframe; when it binds, the smooth line is a slightly faster approximation of the true
+// anchor MA rather than a crash -- and switching Smooth off remains the mathematically-exact
+// stepped variant at ANY timeframe, so exactness is always one click away.
+smoothLenCap = 5000
+ema1Smooth = ta.ema(ema1SrcInput, math.min(math.max(ema1LenInput * emaScale, 1), smoothLenCap))
+ema2Smooth = ta.ema(ema2SrcInput, math.min(math.max(ema2LenInput * emaScale, 1), smoothLenCap))
+smaSmooth  = ta.sma(smaSrcInput,  math.min(math.max(smaLenInput  * smaScale, 1), smoothLenCap))
+
+ema1Value = maSmoothInput ? ema1Smooth : ema1Stepped
+ema2Value = maSmoothInput ? ema2Smooth : ema2Stepped
+smaValue  = maSmoothInput ? smaSmooth  : smaStepped
+
+plot(showEmaOverlay ? ema1Value : na, title = "EMA 1 (Weekly 9 default)", color = ema1Color, linewidth = 1)
+plot(showEmaOverlay ? ema2Value : na, title = "EMA 2 (Weekly 18 default)", color = ema2Color, linewidth = 1)
+plot(showSmaOverlay ? smaValue  : na, title = "SMA 200 (Daily default)", color = smaColor, linewidth = 2)
+
+// =============================================================================================
+// SECTION 9C -- CANDLESTICK PATTERNS: SHARED SIZING CORE (implements TAD V2.2 Section 11.2)
+// =============================================================================================
+// Piece 1 of the Section 11 delivery: the volatility-relative measurement layer every pattern
+// detector in Piece 2 will share. Nothing here renders and nothing here decides trend context --
+// both arrive in later pieces (11.4 rendering, 11.3 context), per the delivery plan.
+//
+// WHY EMA-RELATIVE SIZING (trading rationale): a "small body" or "long shadow" means something
+// completely different in a quiet week than in a news week. Measuring bodies and shadows against
+// a 14-period exponential average of recent body size makes every threshold self-adjusting across
+// volatility regimes, instead of one fixed number silently changing meaning. The 14-period default
+// comes from the studied reference source and is exposed as an input, not hardcoded (TAD 11.2).
+//
+// WHY A PURE FUNCTION (mechanical rationale): f_candleCore reads whichever OHLC context it is
+// evaluated in. Piece 2 will call it INSIDE request.security() for TF1 and for TF2 separately, so
+// each timeframe's patterns are measured on that timeframe's own candles -- never on TF3 -- the
+// same anchor-independent-of-displayed-timeframe philosophy the TF1/TF2 engines already use.
+
+patternBodyAvgLenInput = input.int(14, "Body-size average length", minval = 1, group = "Candlestick Sizing (Shared)", tooltip = "Period of the exponential average of candle body size that every small/long-body and shadow comparison is measured against (TAD V2.2 Section 11.2). Higher = slower-adapting sizing baseline.")
+dojiBodyPctInput       = input.float(5.0, "Doji body % of range", minval = 0.5, step = 0.5, group = "Candlestick Sizing (Shared)", tooltip = "A candle counts as doji-bodied when its body is at or below this percentage of its own total range. The reference source's default is 5%.")
+shadowEqualsInput      = input.float(100.0, "Doji shadow balance tolerance %", minval = 1.0, step = 5.0, group = "Candlestick Sizing (Shared)", tooltip = "For a plain Doji, the two shadows must be roughly balanced: each shadow's deviation from the other must be below this percentage of the other. 100% (the reference default) means neither shadow may be more than double the other. Tighter = stricter balance. This balance requirement is exactly what separates Doji from Spinning Top, which demands long shadows but NOT balanced ones.")
+shadowPercentInput     = input.float(5.0, "Shadow existence % of body", minval = 0.5, step = 0.5, group = "Candlestick Sizing (Shared)", tooltip = "A shadow is treated as existing (hasUpShadow / hasDnShadow) only if it exceeds this percentage of the candle's own body. Used by the Tweezer doji-guard and by hammer-family near-side-shadow checks.")
+spinningPctInput       = input.float(34.0, "Spinning top shadow % of range", minval = 1.0, step = 1.0, group = "Candlestick Sizing (Shared)", tooltip = "A Spinning Top requires BOTH shadows to independently reach at least this percentage of the candle's total range, with a non-doji body. The reference source's default is 34%.")
+hammerFactorInput      = input.float(2.0, "Hammer shadow multiple of body", minval = 1.0, step = 0.5, group = "Candlestick Sizing (Shared)", tooltip = "The hammer-family shared shape check (TAD V2.2 Section 11.2): the dominant shadow must be at least this many times the body size, the body must sit toward the opposite end of the range, and the near-side shadow must be negligible. One shape check serves both Hammer and Hanging Man -- only trend context (Piece 3) decides which label applies.")
+
+// The shared measurement pass. Returns one tuple of series so a single call site computes
+// everything any detector needs, once per timeframe context. Division-by-zero guards are added
+// where the reference source assumed non-zero shadows -- a zero-shadow candle must yield false,
+// not a runtime error.
+f_candleCore() =>
+    bodyHi   = math.max(close, open)
+    bodyLo   = math.min(close, open)
+    body     = bodyHi - bodyLo
+    bodyAvg  = ta.ema(body, patternBodyAvgLenInput)
+    smallBody = body < bodyAvg
+    longBody  = body > bodyAvg
+    upShadow  = high - bodyHi
+    dnShadow  = bodyLo - low
+    hasUpShadow = upShadow > shadowPercentInput / 100.0 * body
+    hasDnShadow = dnShadow > shadowPercentInput / 100.0 * body
+    whiteBody = open < close
+    blackBody = open > close
+    rng       = high - low
+    bodyMiddle = body / 2.0 + bodyLo
+    // Doji: tiny body AND balanced shadows, both required together (TAD 11.2).
+    shadowBalanced = upShadow == dnShadow or (dnShadow != 0 and upShadow != 0 and (math.abs(upShadow - dnShadow) / dnShadow * 100.0) < shadowEqualsInput and (math.abs(dnShadow - upShadow) / upShadow * 100.0) < shadowEqualsInput)
+    isDojiBody = rng > 0 and body <= rng * dojiBodyPctInput / 100.0
+    isDoji     = isDojiBody and shadowBalanced
+    // Spinning top: both shadows independently long, body NOT doji-sized -- the deliberate
+    // contrast with Doji's balance requirement (TAD 11.2). Colour-agnostic on purpose: the
+    // reference's separate White/Black variants are merged into one flag per TAD 11.1.
+    spinningShape = rng > 0 and dnShadow >= rng * spinningPctInput / 100.0 and upShadow >= rng * spinningPctInput / 100.0 and not isDojiBody
+    // Hammer-family shared shape: small body high in the range, long lower shadow, negligible
+    // upper shadow. Hanging Man uses this exact same shape; trend context splits them (Piece 3).
+    hammerShape = smallBody and body > 0 and bodyLo > hl2 and dnShadow >= hammerFactorInput * body and not hasUpShadow
+    [smallBody, longBody, whiteBody, blackBody, isDojiBody, isDoji, spinningShape, hammerShape, hasUpShadow, hasDnShadow, bodyHi, bodyLo, bodyMiddle]
+
+// =============================================================================================
+// SECTION 9D -- CANDLESTICK PATTERNS: DETECTORS & TF1/TF2 PULLS (implements TAD V2.2 Section 11.1)
+// =============================================================================================
+// Piece 2 of the Section 11 delivery: the eleven pattern detectors, built as pure shape-matching
+// logic on top of the Piece 1 sizing core. Trend context (Section 11.3) is deliberately excluded
+// here and arrives in Piece 3, keeping the shape definitions strictly geometric and reusable.
+//
+// UI GROUPING: To keep the settings panel clean (per your earlier request), the 11 patterns are
+// grouped into 6 logical toggles. Bullish/Bearish Engulfing share one toggle; Tweezer Top/Bottom
+// share one; Morning Star and Morning Doji Star share one; Evening Star and Evening Doji Star
+// share one; Hammer and Hanging Man share one. This satisfies the TAD's "one switch per pattern"
+// rule at the pattern-family level without cluttering the UI with 11 separate checkboxes.
+
+// --- Master Render Toggles ---
+renderTf1PatternsInput = input.bool(true, "Render Patterns on TF1", group = "Candlestick Patterns")
+renderTf2PatternsInput = input.bool(true, "Render Patterns on TF2", group = "Candlestick Patterns")
+
+// --- Pattern Family Toggles ---
+patEngulfingInput = input.bool(true, "Engulfing", group = "Candlestick Patterns", inline = "pat1")
+patTweezerInput   = input.bool(true, "Tweezer", group = "Candlestick Patterns", inline = "pat1")
+patSpinningInput  = input.bool(true, "Spinning Top", group = "Candlestick Patterns", inline = "pat2")
+patMorningInput   = input.bool(true, "Morning Star", group = "Candlestick Patterns", inline = "pat2")
+patEveningInput   = input.bool(true, "Evening Star", group = "Candlestick Patterns", inline = "pat3")
+patHammerInput    = input.bool(true, "Hammer / Hanging Man", group = "Candlestick Patterns", inline = "pat3")
+
+// The pure shape detectors. Returns an array of 11 booleans.
+// Trend context (uptrend/downtrend) from the reference source is stripped out here; it will be
+// applied as a gate in Piece 3 (Section 11.3) using TF1-local SMAs or TF2 structural bias.
+f_patterns() =>
+    [smallBody, longBody, whiteBody, blackBody, isDojiBody, isDoji, spinningShape, hammerShape, hasUpShadow, hasDnShadow, bodyHi, bodyLo, bodyMiddle] = f_candleCore()
+    bodyAvg = ta.ema(math.abs(close - open), patternBodyAvgLenInput)
+    
+    // 1. Bullish Engulfing
+    bool p1 = whiteBody and longBody and blackBody[1] and smallBody[1] and close >= open[1] and open <= close[1] and (close > open[1] or open < close[1])
+    // 2. Bearish Engulfing
+    bool p2 = blackBody and longBody and whiteBody[1] and smallBody[1] and close <= open[1] and open >= close[1] and (close < open[1] or open > close[1])
+    
+    // 3. Tweezer Top (Reference doji-guard included)
+    bool tweezerGuard = not isDojiBody or (hasUpShadow and hasDnShadow)
+    bool p3 = tweezerGuard and math.abs(high-high[1]) <= bodyAvg*0.05 and whiteBody[1] and blackBody and longBody[1]
+    // 4. Tweezer Bottom
+    bool p4 = tweezerGuard and math.abs(low-low[1]) <= bodyAvg*0.05 and blackBody[1] and whiteBody and longBody[1]
+    
+    // 5. Spinning Top (Colour-agnostic per TAD 11.1)
+    bool p5 = spinningShape
+    
+    // 6. Morning Star
+    bool p6 = longBody[2] and smallBody[1] and longBody and blackBody[2] and bodyHi[1] < bodyLo[2] and whiteBody and bodyHi >= bodyMiddle[2] and bodyHi < bodyHi[2] and bodyHi[1] < bodyLo
+    // 7. Morning Doji Star (Overlaps with Morning Star if middle candle is doji, per TAD 11.3 known overlap)
+    bool p7 = longBody[2] and isDojiBody[1] and longBody and blackBody[2] and bodyHi[1] < bodyLo[2] and whiteBody and bodyHi >= bodyMiddle[2] and bodyHi < bodyHi[2] and bodyHi[1] < bodyLo
+    
+    // 8. Evening Star
+    bool p8 = longBody[2] and smallBody[1] and longBody and whiteBody[2] and bodyLo[1] > bodyHi[2] and blackBody and bodyLo <= bodyMiddle[2] and bodyLo > bodyLo[2] and bodyLo[1] > bodyHi
+    // 9. Evening Doji Star
+    bool p9 = longBody[2] and isDojiBody[1] and longBody and whiteBody[2] and bodyLo[1] > bodyHi[2] and blackBody and bodyLo <= bodyMiddle[2] and bodyLo > bodyLo[2] and bodyLo[1] > bodyHi
+    
+    // 10. Hammer (Shape only)
+    bool p10 = hammerShape
+    // 11. Hanging Man (Shape only)
+    bool p11 = hammerShape
+    
+        // V2.3 fix: return a single int bitmask instead of an array. Arrays do not reliably cross
+    // the request.security boundary -- when the crossing fails it fails silently (na every bar),
+    // which made every pattern boolean permanently false with no compile or runtime error.
+    // An int is a plain series: the same crossing mechanism Section 4's tuples already use.
+    // Bit map: 1=BullEng, 2=BearEng, 4=TweezerTop, 8=TweezerBot, 16=Spin, 32=MorStar,
+    // 64=MorDoji, 128=EveStar, 256=EveDoji, 512=Hammer, 1024=HangMan
+        // V2.3 fix (CE10005): Pine Script has NO bitwise operators -- the `flags | mask` build can
+    // never compile. Arithmetic base-2 encoding uses only addition and ternaries: each pattern
+    // contributes its own power-of-two weight, so the sum is a unique 11-bit fingerprint with no
+    // bitwise math on either side of the request.security boundary. An int is a plain series --
+    // the same proven crossing mechanism Section 4's tuples already use -- which is why this
+    // replaced the original array<bool> return that crossed silently as na.
+    // Bit map: 1=BullEng, 2=BearEng, 4=TweezerTop, 8=TweezerBot, 16=Spin, 32=MorStar,
+    // 64=MorDoji, 128=EveStar, 256=EveDoji, 512=Hammer, 1024=HangMan
+    int flags = (p1 ? 1 : 0) + (p2 ? 2 : 0) + (p3 ? 4 : 0) + (p4 ? 8 : 0) + (p5 ? 16 : 0) + (p6 ? 32 : 0) + (p7 ? 64 : 0) + (p8 ? 128 : 0) + (p9 ? 256 : 0) + (p10 ? 512 : 0) + (p11 ? 1024 : 0)
+    flags
+
+// Pull the pattern arrays from TF1 and TF2 contexts.
+// lookahead_off ensures we only evaluate on confirmed closed candles of the target timeframe,
+// strictly honoring the non-repainting principle established in Section 4.
+// Pull the pattern flag-word from each timeframe's own candle context. lookahead_off keeps the
+// non-repainting convention: at any chart bar the flag-word reflects the forming higher-timeframe
+// candle's in-progress evaluation, so the just-closed candle's final result is read at [1] on the
+// roll bar -- exactly the convention Sections 7 and 8 use for OHLC (and Section 9F-a for these).
+tf1PatFlags = request.security(syminfo.tickerid, tf1Input, f_patterns(), lookahead = barmerge.lookahead_off)
+tf2PatFlags = request.security(syminfo.tickerid, tf2Input, f_patterns(), lookahead = barmerge.lookahead_off)
+
+// Decode helper with no bitwise operators (Pine has none): for a power-of-two weight m, that bit
+// is set in the sum exactly when the remainder of flags divided by 2m is at least m.
+// Example: flags = 5 (BullEng + TweezerTop), mask = 4: 5 % 8 = 5 >= 4 -> true. mask = 2: 5 % 4 = 1 >= 2 -> false.
+f_bit(int flags, int mask) =>
+    (flags % (2 * mask)) >= mask
+
+// TF1 Pattern States (trend-context gate applied later, Section 9E)
+bool tf1_BullEng    = f_bit(tf1PatFlags, 1)    and patEngulfingInput
+bool tf1_BearEng    = f_bit(tf1PatFlags, 2)    and patEngulfingInput
+bool tf1_TweezerTop = f_bit(tf1PatFlags, 4)    and patTweezerInput
+bool tf1_TweezerBot = f_bit(tf1PatFlags, 8)    and patTweezerInput
+bool tf1_Spinning   = f_bit(tf1PatFlags, 16)   and patSpinningInput
+bool tf1_MorStar    = f_bit(tf1PatFlags, 32)   and patMorningInput
+bool tf1_MorDoji    = f_bit(tf1PatFlags, 64)   and patMorningInput
+bool tf1_EveStar    = f_bit(tf1PatFlags, 128)  and patEveningInput
+bool tf1_EveDoji    = f_bit(tf1PatFlags, 256)  and patEveningInput
+bool tf1_Hammer     = f_bit(tf1PatFlags, 512)  and patHammerInput
+bool tf1_HangMan    = f_bit(tf1PatFlags, 1024) and patHammerInput
+
+// TF2 Pattern States
+bool tf2_BullEng    = f_bit(tf2PatFlags, 1)    and patEngulfingInput
+bool tf2_BearEng    = f_bit(tf2PatFlags, 2)    and patEngulfingInput
+bool tf2_TweezerTop = f_bit(tf2PatFlags, 4)    and patTweezerInput
+bool tf2_TweezerBot = f_bit(tf2PatFlags, 8)    and patTweezerInput
+bool tf2_Spinning   = f_bit(tf2PatFlags, 16)   and patSpinningInput
+bool tf2_MorStar    = f_bit(tf2PatFlags, 32)   and patMorningInput
+bool tf2_MorDoji    = f_bit(tf2PatFlags, 64)   and patMorningInput
+bool tf2_EveStar    = f_bit(tf2PatFlags, 128)  and patEveningInput
+bool tf2_EveDoji    = f_bit(tf2PatFlags, 256)  and patEveningInput
+bool tf2_Hammer     = f_bit(tf2PatFlags, 512)  and patHammerInput
+bool tf2_HangMan    = f_bit(tf2PatFlags, 1024) and patHammerInput
+
+// =============================================================================================
+// SECTION 9E -- CANDLESTICK PATTERNS: TREND CONTEXT (implements TAD V2.2 Section 11.3)
+// =============================================================================================
+// Piece 3 of the Section 11 delivery: the trend-context gating layer.
+// Per TAD V2.2 Section 11.3, TF2 patterns reference TF2's own confirmed structural bias (Section
+// 7.2). TF1 patterns reference a separate, TF1-local trend read using the same moving-average
+// mechanism the studied reference used (SMA50, stacked SMA50/SMA200, or off).
+// This TF1-local read explicitly does NOT feed into the Section 7.2 bias state machine. It exists
+// solely as a local gating signal for candlestick pattern labeling on TF1's own chart.
+
+tf1TrendRuleInput    = input.string("Price vs Fast SMA", "TF1 Trend Context Rule", options=["Price vs Fast SMA", "Stacked Fast/Slow SMA", "No detection"], group = "Candlestick Patterns", tooltip = "How TF1 candlestick patterns determine their local trend context (TAD V2.2 Section 11.3). The studied reference's fixed SMA50 / stacked SMA50-200 rules survive as the DEFAULT LENGTHS below, but both periods are fully user-configurable -- the mode names describe the mechanism, not hardcoded numbers. This is a separate, TF1-local read; it does NOT interact with or alter the TF2 structural bias state machine.")
+tf1TrendFastLenInput = input.int(50, "Fast SMA length", minval = 1, group = "Candlestick Patterns", inline = "tf1TrendLens", tooltip = "Fast leg of the TF1-local trend read. 50 = the reference default. Applies in both detection modes.")
+tf1TrendSlowLenInput = input.int(200, "Slow SMA length", minval = 1, group = "Candlestick Patterns", inline = "tf1TrendLens", tooltip = "Slow leg of the TF1-local trend read, used only in Stacked mode. 200 = the reference default.")
+
+// Pull TF1 SMAs and Close for local trend calculation, at user-configured lengths
+tf1SmaFast = request.security(syminfo.tickerid, tf1Input, ta.sma(close, tf1TrendFastLenInput), lookahead = barmerge.lookahead_off)
+tf1SmaSlow = request.security(syminfo.tickerid, tf1Input, ta.sma(close, tf1TrendSlowLenInput), lookahead = barmerge.lookahead_off)
+tf1Close   = request.security(syminfo.tickerid, tf1Input, close, lookahead = barmerge.lookahead_off)
+
+// Calculate TF1 Local Trend Context
+bool tf1_LocalUpTrend = false
+bool tf1_LocalDownTrend = false
+
+if tf1TrendRuleInput == "Price vs Fast SMA"
+    tf1_LocalUpTrend := tf1Close > tf1SmaFast
+    tf1_LocalDownTrend := tf1Close < tf1SmaFast
+else if tf1TrendRuleInput == "Stacked Fast/Slow SMA"
+    tf1_LocalUpTrend := tf1Close > tf1SmaFast and tf1SmaFast > tf1SmaSlow
+    tf1_LocalDownTrend := tf1Close < tf1SmaFast and tf1SmaFast < tf1SmaSlow
+else // "No detection"
+    tf1_LocalUpTrend := true
+    tf1_LocalDownTrend := true
+
+// Calculate TF2 Structural Trend Context (from Section 7.2 bias state machine)
+// If bias is "undefined", neither is true, meaning TF2 patterns won't fire until structure is established.
+bool tf2_LocalUpTrend = (bias == "bullish")
+bool tf2_LocalDownTrend = (bias == "bearish")
+
+// Apply Trend Context Gates to Pattern Detections to produce the final filtered states
+// TF1 Patterns
+bool final_tf1_BullEng    = tf1_BullEng    and tf1_LocalDownTrend // Bullish Engulfing happens in downtrend
+bool final_tf1_BearEng    = tf1_BearEng    and tf1_LocalUpTrend   // Bearish Engulfing happens in uptrend
+bool final_tf1_TweezerTop = tf1_TweezerTop and tf1_LocalUpTrend
+bool final_tf1_TweezerBot = tf1_TweezerBot and tf1_LocalDownTrend
+bool final_tf1_Spinning   = tf1_Spinning   and (tf1_LocalUpTrend or tf1_LocalDownTrend) // Trend agnostic
+bool final_tf1_MorStar    = tf1_MorStar    and tf1_LocalDownTrend
+bool final_tf1_MorDoji    = tf1_MorDoji    and tf1_LocalDownTrend
+bool final_tf1_EveStar    = tf1_EveStar    and tf1_LocalUpTrend
+bool final_tf1_EveDoji    = tf1_EveDoji    and tf1_LocalUpTrend
+bool final_tf1_Hammer     = tf1_Hammer     and tf1_LocalDownTrend
+bool final_tf1_HangMan    = tf1_HangMan    and tf1_LocalUpTrend
+
+// TF2 Patterns
+bool final_tf2_BullEng    = tf2_BullEng    and tf2_LocalDownTrend
+bool final_tf2_BearEng    = tf2_BearEng    and tf2_LocalUpTrend
+bool final_tf2_TweezerTop = tf2_TweezerTop and tf2_LocalUpTrend
+bool final_tf2_TweezerBot = tf2_TweezerBot and tf2_LocalDownTrend
+bool final_tf2_Spinning   = tf2_Spinning   and (tf2_LocalUpTrend or tf2_LocalDownTrend) // Trend agnostic
+bool final_tf2_MorStar    = tf2_MorStar    and tf2_LocalDownTrend
+bool final_tf2_MorDoji    = tf2_MorDoji    and tf2_LocalDownTrend
+bool final_tf2_EveStar    = tf2_EveStar    and tf2_LocalUpTrend
+bool final_tf2_EveDoji    = tf2_EveDoji    and tf2_LocalUpTrend
+bool final_tf2_Hammer     = tf2_Hammer     and tf2_LocalDownTrend
+bool final_tf2_HangMan    = tf2_HangMan    and tf2_LocalUpTrend
+
+// =============================================================================================
+// SECTION 9F -- CANDLESTICK PATTERNS: RENDERING, STAMPS & BOUNDED LIFETIME
+// (implements TAD V2.2 Sections 11.4 & 11.5)
+// =============================================================================================
+// Piece 4 of the Section 11 delivery: turns the gated detection states from Section 9E into
+// chart markers, with the two constraints this module was explicitly warned about.
+//
+// WHY LABELS, NOT PLOTSHAPE (trading + mechanical rationale): a pattern marker belongs to the
+// historical candle that formed it, forever. plotshape can only draw on the bar currently being
+// computed, so it can never place a marker back onto a past candle -- this project already paid
+// for that lesson once with the Critical Swing markers. label.new with xloc.bar_time stamps the
+// marker at the pattern candle's own opening timestamp, where it stays correct across every
+// timeframe switch and zoom level.
+//
+// WHY STAMPS + REDRAW (mechanical rationale): detection records a PatternMark stamp (time, price,
+// code, direction) the moment a pattern fires, with no drawing object attached (id = na). The
+// render pass below creates the label from the stamp on demand. That separation is what makes
+// every toggle reversible without a chart reload: switching a gate off deletes the label objects
+// but keeps the stamps; switching it back on redraws from stored stamps instantly. Abandoning
+// objects instead of deleting them, or deleting the underlying records, are the two failure
+// classes this system has already been bitten by -- neither is repeated here.
+//
+// WHY A RETAINED-COUNT CAP (TAD 11.5, mandatory): pattern labels draw against the same shared,
+// finite 500-label budget as Critical Swing markers, session range labels, and divider labels.
+// Unmanaged, a long-running chart would silently exhaust that budget and starve every other
+// label consumer with no visible error. Each layer's stamp array is therefore capped by input,
+// oldest-first, deleting the evicted stamp's label along with it.
+
+patternLabelKeepInput = input.int(40, "Retained pattern labels (per layer)", minval = 1, maxval = 250, group = "Candlestick Patterns", tooltip = "Bounded Lifetime cap (TAD V2.2 Section 11.5): how many pattern labels each layer may hold -- TF1's set and TF2's set are counted separately, per Section 11.4's rule that the two layers are fully independent. Oldest-first deletion once exceeded, label deleted together with its stamp.")
+patternLabelSizeInput = input.string("Tiny", "Pattern label size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = "Candlestick Patterns", tooltip = "Deliberately defaulted to Tiny: pattern markers sit BELOW Market Structure and Critical Swings in this system's visual hierarchy. They annotate; they do not declare.")
+patternBullColor      = input.color(#26a69a, "Bullish pattern color", group = "Candlestick Patterns", inline = "patColors")
+patternBearColor      = input.color(#ef5350, "Bearish pattern color", group = "Candlestick Patterns", inline = "patColors")
+patternNeutralColor   = input.color(#787B86, "Neutral pattern color", group = "Candlestick Patterns", inline = "patColors", tooltip = "Used by trend-agnostic patterns (Spinning Top), which signal indecision rather than direction.")
+
+var patternLabelSize = switch patternLabelSizeInput
+    "Tiny"   => size.tiny
+    "Small"  => size.small
+    "Normal" => size.normal
+    "Large"  => size.large
+    "Huge"   => size.huge
+
+// One recorded pattern event. t = the pattern candle's own opening timestamp (anchor), y = the
+// placement price, code = short marker text, dir = "bull" | "bear" | "neutral", id = the label
+// handle (na while hidden). Keeping the handle on the stamp gives it the stamp's exact lifecycle.
+type PatternMark
+    int    t
+    float  y
+    string code
+    string dir
+    label  id
+
+var array<PatternMark> patMarksTf1 = array.new<PatternMark>()
+var array<PatternMark> patMarksTf2 = array.new<PatternMark>()
+
+// Records a detection and enforces the retained-count cap in the same act: evicting the oldest
+// stamp deletes its label too, so the drawing-object budget and the stamp array can never drift
+// apart in size.
+f_pushPatMark(array<PatternMark> arr, int t, float y, string code, string dir) =>
+    array.push(arr, PatternMark.new(t = t, y = y, code = code, dir = dir, id = na))
+    while array.size(arr) > patternLabelKeepInput
+        oldMark = array.shift(arr)
+        if not na(oldMark.id)
+            label.delete(oldMark.id)
+    true
+
+// TF2 candle extremes, needed only for marker placement on the TF2 layer (the TF1 layer reuses
+// Section 4's existing tf1H/tf1L pulls). [1] inside the security context is the just-closed TF2
+// candle at the roll-detection bar, matching Section 4's proven data-integrity convention.
+[tf2CandleHigh, tf2CandleLow] = request.security(syminfo.tickerid, tf2Input, [high[1], low[1]], lookahead = barmerge.lookahead_off)
+
+// --- 9F-a. Detection: record stamps at each timeframe's roll bar ---
+// Detection runs regardless of any render gate: stamps are the record of what happened, gates
+// only decide what is currently drawn. newTf1Bar/newTf2Bar (Sections 7/8) fire exactly once per
+// higher-timeframe candle close.
+// V2.3 fix: every final_* state is read at [1] here, matching Sections 7/8's data-integrity
+// convention. At the roll bar, the UN-shifted security value is the NEW forming candle's
+// one-bar-partial evaluation -- which can almost never satisfy a multi-candle pattern -- while
+// [1] holds the just-closed candle's complete, gated pattern result. Reading un-shifted (the
+// original Piece 4 behaviour) stamped nothing, ever.
+if newTf1Bar and not na(tf1T[1])
+    bullOff1 = tf1L[1] * 0.0015
+    bearOff1 = tf1H[1] * 0.0015
+    if final_tf1_BullEng[1]
+        f_pushPatMark(patMarksTf1, tf1T[1], tf1L[1] - bullOff1, "ENG", "bull")
+    if final_tf1_BearEng[1]
+        f_pushPatMark(patMarksTf1, tf1T[1], tf1H[1] + bearOff1, "ENG", "bear")
+    if final_tf1_TweezerBot[1]
+        f_pushPatMark(patMarksTf1, tf1T[1], tf1L[1] - bullOff1, "TWZ", "bull")
+    if final_tf1_TweezerTop[1]
+        f_pushPatMark(patMarksTf1, tf1T[1], tf1H[1] + bearOff1, "TWZ", "bear")
+    if final_tf1_MorStar[1]
+        f_pushPatMark(patMarksTf1, tf1T[1], tf1L[1] - bullOff1, "MST", "bull")
+    if final_tf1_MorDoji[1]
+        f_pushPatMark(patMarksTf1, tf1T[1], tf1L[1] - bullOff1, "MDS", "bull")
+    if final_tf1_EveStar[1]
+        f_pushPatMark(patMarksTf1, tf1T[1], tf1H[1] + bearOff1, "EST", "bear")
+    if final_tf1_EveDoji[1]
+        f_pushPatMark(patMarksTf1, tf1T[1], tf1H[1] + bearOff1, "EDS", "bear")
+    if final_tf1_Hammer[1]
+        f_pushPatMark(patMarksTf1, tf1T[1], tf1L[1] - bullOff1, "HAM", "bull")
+    if final_tf1_HangMan[1]
+        f_pushPatMark(patMarksTf1, tf1T[1], tf1H[1] + bearOff1, "HGM", "bear")
+    if final_tf1_Spinning[1]
+        f_pushPatMark(patMarksTf1, tf1T[1], tf1L[1] - bullOff1, "SPN", "neutral")
+
+if newTf2Bar and not na(tf2T[1])
+    bullOff2 = tf2CandleLow * 0.0015
+    bearOff2 = tf2CandleHigh * 0.0015
+    if final_tf2_BullEng[1]
+        f_pushPatMark(patMarksTf2, tf2T[1], tf2CandleLow - bullOff2, "ENG", "bull")
+    if final_tf2_BearEng[1]
+        f_pushPatMark(patMarksTf2, tf2T[1], tf2CandleHigh + bearOff2, "ENG", "bear")
+    if final_tf2_TweezerBot[1]
+        f_pushPatMark(patMarksTf2, tf2T[1], tf2CandleLow - bullOff2, "TWZ", "bull")
+    if final_tf2_TweezerTop[1]
+        f_pushPatMark(patMarksTf2, tf2T[1], tf2CandleHigh + bearOff2, "TWZ", "bear")
+    if final_tf2_MorStar[1]
+        f_pushPatMark(patMarksTf2, tf2T[1], tf2CandleLow - bullOff2, "MST", "bull")
+    if final_tf2_MorDoji[1]
+        f_pushPatMark(patMarksTf2, tf2T[1], tf2CandleLow - bullOff2, "MDS", "bull")
+    if final_tf2_EveStar[1]
+        f_pushPatMark(patMarksTf2, tf2T[1], tf2CandleHigh + bearOff2, "EST", "bear")
+    if final_tf2_EveDoji[1]
+        f_pushPatMark(patMarksTf2, tf2T[1], tf2CandleHigh + bearOff2, "EDS", "bear")
+    if final_tf2_Hammer[1]
+        f_pushPatMark(patMarksTf2, tf2T[1], tf2CandleLow - bullOff2, "HAM", "bull")
+    if final_tf2_HangMan[1]
+        f_pushPatMark(patMarksTf2, tf2T[1], tf2CandleHigh + bearOff2, "HGM", "bear")
+    if final_tf2_Spinning[1]
+        f_pushPatMark(patMarksTf2, tf2T[1], tf2CandleLow - bullOff2, "SPN", "neutral")
+
+// --- 9F-b. Render pass: gates, creation, and explicit hiding ---
+// Gate composition: the layer's own dynamic visibility gate (showTf1/showTf2 -- a Weekly pattern
+// marker on a Monthly chart is meaningless, same principle as every other level here) AND the
+// module's master render toggle for that layer (Section 11.4). Per-pattern family toggles were
+// already applied upstream in Sections 9D/9E.
+drawTf1Pats = showTf1 and renderTf1PatternsInput
+drawTf2Pats = showTf2 and renderTf2PatternsInput
+
+f_patColor(dir) =>
+    dir == "bull" ? patternBullColor : dir == "bear" ? patternBearColor : patternNeutralColor
+
+f_patStyle(dir) =>
+    dir == "bear" ? label.style_label_down : label.style_label_up
+
+if drawTf1Pats
+    for m in patMarksTf1
+        if na(m.id)
+            m.id := label.new(x = m.t, y = m.y, text = m.code, xloc = xloc.bar_time, yloc = yloc.price, style = f_patStyle(m.dir), color = f_patColor(m.dir), textcolor = color.white, size = patternLabelSize)
+        else
+            // Colour refreshed every bar so input changes restyle existing markers live, matching
+            // how TF2 structure lines behave.
+            label.set_color(m.id, f_patColor(m.dir))
+else
+    // Gate closed: delete the objects, KEEP the stamps. Reopening the gate (or switching back
+    // down to a valid TF3) redraws every retained marker from its stamp on the next bar.
+    for m in patMarksTf1
+        if not na(m.id)
+            label.delete(m.id)
+            m.id := na
+
+if drawTf2Pats
+    for m in patMarksTf2
+        if na(m.id)
+            m.id := label.new(x = m.t, y = m.y, text = m.code, xloc = xloc.bar_time, yloc = yloc.price, style = f_patStyle(m.dir), color = f_patColor(m.dir), textcolor = color.white, size = patternLabelSize)
+        else
+            label.set_color(m.id, f_patColor(m.dir))
+else
+    for m in patMarksTf2
+        if not na(m.id)
+            label.delete(m.id)
+            m.id := na
+
+// =============================================================================================
+// SECTION 10 -- SESSIONS: CONSTANTS & INPUTS
+// =============================================================================================
+// Adapted from "Sessions [LuxAlgo]" (c) LuxAlgo, CC BY-NC-SA 4.0. Constants, inputs, and
+// tooltips below are unchanged from the original -- no identifier in this section collided with
+// anything in Sections 1-9, so nothing needed renaming.
+color BULL_COLOR         = #089981
+color BEAR_COLOR         = #f23645
+color DATA               = #DBDBDB
+color HEADERS            = #808080
+color BACKGROUND         = #161616
+color BORDERS            = #2E2E2E
+
+string TOP_RIGHT         = "Top Right"
+string BOTTOM_RIGHT      = "Bottom Right"
+string BOTTOM_LEFT       = "Bottom Left"
+
+string TINY              = "Tiny"
+string SMALL             = "Small"
+string NORMAL            = "Normal"
+string LARGE             = "Large"
+string HUGE              = "Huge"
+
+string SESSION_A_GROUP   = "Session A"
+string SESSION_B_GROUP   = "Session B"
+string SESSION_C_GROUP   = "Session C"
+string SESSION_D_GROUP   = "Session D"
+string TIMEZONE_GROUP    = "Timezone"
+string RANGES_GROUP      = "Ranges Settings"
+string STYLE_GROUP       = "Style"
+string DASHBOARD_GROUP   = "Dashboard"
+string DIVIDERS_GROUP    = "Dividers"
+
+string showSessionTooltip        = "Enable or disable this session and all of its optional displays."
+string sessionNameTooltip        = "Set the name displayed for this session."
+string sessionTimeTooltip        = "Set the session's start and end times."
+string sessionRangeTooltip       = "Draw a box around the high-to-low range formed during the session."
+string sessionTrendlineTooltip   = "Draw a linear-regression trendline during the session."
+string sessionMeanTooltip        = "Draw the running arithmetic mean during the session."
+string sessionVwapTooltip        = "Plot the running volume-weighted average price during the session."
+string sessionMaxMinTooltip      = "Extend the completed session's maximum and minimum until the next session begins."
+string sessionColorTooltip       = "Select the color used for this session's visuals."
+string timezoneOffsetTooltip     = "Set the fixed UTC offset used to interpret all session times."
+string exchangeTimezoneTooltip   = "Use the symbol's exchange timezone instead of the fixed UTC offset."
+string rangeTransparencyTooltip  = "Set the transparency of session range boxes from 0 (opaque) to 100 (invisible)."
+string rangeOutlineTooltip       = "Show a dotted outline around each session range box."
+string rangeLabelTooltip         = "Show the session name above each range box."
+string dashboardTooltip          = "Enable or disable the dashboard."
+string advancedDashboardTooltip  = "Add trend, cumulative volume, and volatility statistics to the dashboard."
+string dashboardPositionTooltip  = "Select the dashboard location."
+string dashboardSizeTooltip      = "Select the dashboard text size."
+string sessionDividerTooltip     = "Mark active session bars and session boundaries along the bottom of the chart."
+string dayDividerTooltip         = "Draw a dashed divider and weekday label when a new day begins."
+
+bool showSessionAInput       = input.bool(true, "Enable", group = SESSION_A_GROUP, tooltip = showSessionTooltip, inline = "sessionA")
+string sessionANameInput     = input.string("New York", "Name", group = SESSION_A_GROUP, tooltip = sessionNameTooltip, inline = "sessionA")
+string sessionATimeInput     = input.session("1300-2200", "Hours", group = SESSION_A_GROUP, tooltip = sessionTimeTooltip)
+bool sessionARangeInput      = input.bool(true, "Range", group = SESSION_A_GROUP, tooltip = sessionRangeTooltip, inline = "sessionAOverlays")
+bool sessionATrendlineInput  = input.bool(false, "Trendline", group = SESSION_A_GROUP, tooltip = sessionTrendlineTooltip, inline = "sessionAOverlays")
+bool sessionAMeanInput       = input.bool(false, "Mean", group = SESSION_A_GROUP, tooltip = sessionMeanTooltip, inline = "sessionAOverlays")
+bool sessionAVwapInput       = input.bool(false, "VWAP", group = SESSION_A_GROUP, tooltip = sessionVwapTooltip, inline = "sessionAOverlays")
+bool sessionAMaxMinInput     = input.bool(false, "Max/Min", group = SESSION_A_GROUP, tooltip = sessionMaxMinTooltip, inline = "sessionAOverlays")
+
+bool showSessionBInput       = input.bool(true, "Enable", group = SESSION_B_GROUP, tooltip = showSessionTooltip, inline = "sessionB")
+string sessionBNameInput     = input.string("London", "Name", group = SESSION_B_GROUP, tooltip = sessionNameTooltip, inline = "sessionB")
+string sessionBTimeInput     = input.session("0700-1600", "Hours", group = SESSION_B_GROUP, tooltip = sessionTimeTooltip)
+bool sessionBRangeInput      = input.bool(true, "Range", group = SESSION_B_GROUP, tooltip = sessionRangeTooltip, inline = "sessionBOverlays")
+bool sessionBTrendlineInput  = input.bool(false, "Trendline", group = SESSION_B_GROUP, tooltip = sessionTrendlineTooltip, inline = "sessionBOverlays")
+bool sessionBMeanInput       = input.bool(false, "Mean", group = SESSION_B_GROUP, tooltip = sessionMeanTooltip, inline = "sessionBOverlays")
+bool sessionBVwapInput       = input.bool(false, "VWAP", group = SESSION_B_GROUP, tooltip = sessionVwapTooltip, inline = "sessionBOverlays")
+bool sessionBMaxMinInput     = input.bool(false, "Max/Min", group = SESSION_B_GROUP, tooltip = sessionMaxMinTooltip, inline = "sessionBOverlays")
+
+bool showSessionCInput       = input.bool(true, "Enable", group = SESSION_C_GROUP, tooltip = showSessionTooltip, inline = "sessionC")
+string sessionCNameInput     = input.string("Tokyo", "Name", group = SESSION_C_GROUP, tooltip = sessionNameTooltip, inline = "sessionC")
+string sessionCTimeInput     = input.session("0000-0900", "Hours", group = SESSION_C_GROUP, tooltip = sessionTimeTooltip)
+bool sessionCRangeInput      = input.bool(true, "Range", group = SESSION_C_GROUP, tooltip = sessionRangeTooltip, inline = "sessionCOverlays")
+bool sessionCTrendlineInput  = input.bool(false, "Trendline", group = SESSION_C_GROUP, tooltip = sessionTrendlineTooltip, inline = "sessionCOverlays")
+bool sessionCMeanInput       = input.bool(false, "Mean", group = SESSION_C_GROUP, tooltip = sessionMeanTooltip, inline = "sessionCOverlays")
+bool sessionCVwapInput       = input.bool(false, "VWAP", group = SESSION_C_GROUP, tooltip = sessionVwapTooltip, inline = "sessionCOverlays")
+bool sessionCMaxMinInput     = input.bool(false, "Max/Min", group = SESSION_C_GROUP, tooltip = sessionMaxMinTooltip, inline = "sessionCOverlays")
+
+bool showSessionDInput       = input.bool(true, "Enable", group = SESSION_D_GROUP, tooltip = showSessionTooltip, inline = "sessionD")
+string sessionDNameInput     = input.string("Sydney", "Name", group = SESSION_D_GROUP, tooltip = sessionNameTooltip, inline = "sessionD")
+string sessionDTimeInput     = input.session("2100-0600", "Hours", group = SESSION_D_GROUP, tooltip = sessionTimeTooltip)
+bool sessionDRangeInput      = input.bool(true, "Range", group = SESSION_D_GROUP, tooltip = sessionRangeTooltip, inline = "sessionDOverlays")
+bool sessionDTrendlineInput  = input.bool(false, "Trendline", group = SESSION_D_GROUP, tooltip = sessionTrendlineTooltip, inline = "sessionDOverlays")
+bool sessionDMeanInput       = input.bool(false, "Mean", group = SESSION_D_GROUP, tooltip = sessionMeanTooltip, inline = "sessionDOverlays")
+bool sessionDVwapInput       = input.bool(false, "VWAP", group = SESSION_D_GROUP, tooltip = sessionVwapTooltip, inline = "sessionDOverlays")
+bool sessionDMaxMinInput     = input.bool(false, "Max/Min", group = SESSION_D_GROUP, tooltip = sessionMaxMinTooltip, inline = "sessionDOverlays")
+
+int timezoneOffsetInput       = input.int(0, "UTC (+/-)", group = TIMEZONE_GROUP, tooltip = timezoneOffsetTooltip, minval = -12, maxval = 14)
+bool useExchangeTimezoneInput = input.bool(false, "Use Exchange Timezone", group = TIMEZONE_GROUP, tooltip = exchangeTimezoneTooltip)
+
+// --- Period Dividers (new -- replaces the old, LuxAlgo-inherited "Show Daily Divider") ---
+// Declared here, immediately after Timezone, purely for settings-panel ordering: TradingView lays
+// input groups out in the order their first input is declared, so this is what puts Dividers
+// directly beneath Timezone in the panel.
+//
+// The old Daily Divider silently never rendered above 30-minute charts, because it was gated by
+// sessionsTimeframeOk -- a cutoff that exists for genuinely intraday session shading and was never
+// appropriate for period dividers. Nothing below is gated by it.
+string DIVIDERS_NEW_GROUP = "Period Dividers"
+bool showDiv4hInput      = input.bool(false, "4 Hour",   group = DIVIDERS_NEW_GROUP, inline = "divToggles1")
+bool showDivDailyInput   = input.bool(true,  "Daily",    group = DIVIDERS_NEW_GROUP, inline = "divToggles1")
+bool showDivWeeklyInput  = input.bool(false, "Weekly",   group = DIVIDERS_NEW_GROUP, inline = "divToggles1")
+bool showDivMonthlyInput = input.bool(false, "Monthly",  group = DIVIDERS_NEW_GROUP, inline = "divToggles2")
+bool showDivQuarterInput = input.bool(false, "Quarterly", group = DIVIDERS_NEW_GROUP, inline = "divToggles2")
+int  dividerLookbackInput = input.int(20, "Lookback (how many to keep)", minval = 1, maxval = 200, group = DIVIDERS_NEW_GROUP, tooltip = "One shared count, applied per enabled divider type in that type's OWN units. Set to 20: the Daily toggle shows the last 20 days, the Weekly toggle the last 20 weeks, and so on. Older dividers are deleted, not just hidden, so this also bounds how many drawing objects the module can ever hold.")
+int  dividerOpacityInput  = input.int(25, "Opacity %", minval = 0, maxval = 100, group = DIVIDERS_NEW_GROUP, tooltip = "100 = solid, 0 = invisible. Applies to both the divider line and its label.")
+color dividerColorInput   = input.color(#787B86, "Colour", group = DIVIDERS_NEW_GROUP, inline = "divStyle")
+string dividerLabelPosInput = input.string("Top", "Label", options = ["Top", "Bottom", "None"], group = DIVIDERS_NEW_GROUP, inline = "divStyle", tooltip = "Where the period name sits. 'None' draws the lines without any label.")
+
+int rangeTransparencyInput   = input.int(90, "Range Area Transparency", group = RANGES_GROUP, tooltip = rangeTransparencyTooltip, minval = 0, maxval = 100)
+bool showRangeOutlineInput   = input.bool(true, "Range Outline", group = RANGES_GROUP, tooltip = rangeOutlineTooltip)
+bool showRangeLabelInput     = input.bool(true, "Range Label", group = RANGES_GROUP, tooltip = rangeLabelTooltip)
+int sessionRangeKeepInput = input.int(60, "Retained completed ranges", group = RANGES_GROUP, minval = 1, maxval = 500, tooltip = "Bounded Lifetime cap: how many FINISHED session range boxes (and their name labels) may stay on the chart. When a session slot is reused, the outgoing box is retired into a capped history and the oldest one is deleted outright. The inherited code had no cap and no way to delete old boxes at all, which exhausted Pine's 500-box drawing limit during the first history replay on any timeframe at or below 30 minutes -- the runtime error previously seen when switching down to session timeframes.")
+int sessionLineKeepInput  = input.int(60, "Retained completed trend/mean lines", group = RANGES_GROUP, minval = 1, maxval = 500, tooltip = "The same Bounded Lifetime cap applied to finished session trendlines and running-mean lines. Only visible when those overlays are switched on, but the cap is enforced regardless so enabling them later can never leak objects.")
+
+color sessionAColorInput     = input.color(#ff5d00, "New York", group = STYLE_GROUP, tooltip = sessionColorTooltip, inline = "sessionColors")
+color sessionBColorInput     = input.color(#2157f3, "London", group = STYLE_GROUP, tooltip = sessionColorTooltip, inline = "sessionColors")
+color sessionCColorInput     = input.color(#e91e63, "Tokyo", group = STYLE_GROUP, tooltip = sessionColorTooltip, inline = "sessionColors2")
+color sessionDColorInput     = input.color(#ffeb3b, "Sydney", group = STYLE_GROUP, tooltip = sessionColorTooltip, inline = "sessionColors2")
+
+bool dashboardInput          = input.bool(false, "Dashboard", group = DASHBOARD_GROUP, tooltip = dashboardTooltip)
+bool advancedDashboardInput  = input.bool(false, "Advanced", group = DASHBOARD_GROUP, tooltip = advancedDashboardTooltip)
+string dashboardPositionInput = input.string(TOP_RIGHT, "Position", group = DASHBOARD_GROUP, tooltip = dashboardPositionTooltip, options = [TOP_RIGHT, BOTTOM_RIGHT, BOTTOM_LEFT])
+string dashboardSizeInput     = input.string(SMALL, "Size", group = DASHBOARD_GROUP, tooltip = dashboardSizeTooltip, options = [TINY, SMALL, NORMAL, LARGE, HUGE])
+
+bool showSessionDividerInput = input.bool(false, "Show Sessions Divider", group = DIVIDERS_GROUP, tooltip = sessionDividerTooltip)
+
+// =============================================================================================
+// SECTION 11 -- SESSIONS: TIMEFRAME-ACCURACY GATE (new)
+// =============================================================================================
+// You previously enforced ">30min only" via this indicator's own Visibility tab. Now that one
+// Visibility tab covers this whole merged script, that native toggle can't apply to only the
+// Sessions half without also hiding TF1/TF2 above 30min -- so the same cutoff is reproduced here
+// in code instead, and applied everywhere the original checked showSessionX/showSessionDivider.
+// Hardcoded at 30 minutes to match what you had; trivial to change if you want a different cutoff.
+sessionsTimeframeOk = timeframe.in_seconds() <= timeframe.in_seconds("30")
+
+bool effectiveShowSessionA = showSessionAInput and sessionsTimeframeOk
+bool effectiveShowSessionB = showSessionBInput and sessionsTimeframeOk
+bool effectiveShowSessionC = showSessionCInput and sessionsTimeframeOk
+bool effectiveShowSessionD = showSessionDInput and sessionsTimeframeOk
+bool effectiveShowSessionDivider = showSessionDividerInput and sessionsTimeframeOk
+
+// =============================================================================================
+// SECTION 12 -- SESSIONS: PARSED SETTINGS
+// =============================================================================================
+var parsedDashboardPosition = switch dashboardPositionInput
+    TOP_RIGHT    => position.top_right
+    BOTTOM_RIGHT => position.bottom_right
+    BOTTOM_LEFT  => position.bottom_left
+
+var parsedDashboardSize = switch dashboardSizeInput
+    TINY   => size.tiny
+    SMALL  => size.small
+    NORMAL => size.normal
+    LARGE  => size.large
+    HUGE   => size.huge
+
+string sessionTimezone = useExchangeTimezoneInput ? syminfo.timezone : str.format("UTC{0}{1}", timezoneOffsetInput >= 0 ? "+" : "-", math.abs(timezoneOffsetInput))
+int barNumber = bar_index
+
+// =============================================================================================
+// SECTION 13 -- SESSIONS: HELPER FUNCTIONS
+// =============================================================================================
+cell(table tableId, int column, int row, string data, color textColor = #DBDBDB, string alignment = text.align_right, color background = na, float height = 0.0) =>
+    tableId.cell(column, row, data, text_color = textColor, text_size = parsedDashboardSize, text_halign = alignment, bgcolor = background, height = height)
+
+divider(table tableId, int row, int lastColumn) =>
+    string rowDivider = "━━━━━━━━━━━━━━"
+    tableId.merge_cells(0, row, lastColumn, row)
+    cell(tableId, 0, row, rowDivider, textColor = BORDERS, alignment = text.align_center, height = 0.5)
+
+
+// =============================================================================================
+// SECTION 14 -- SESSIONS: SESSION DETECTION
+// =============================================================================================
+bool sessionAActive = not na(time(timeframe.period, sessionATimeInput, sessionTimezone))
+bool sessionBActive = not na(time(timeframe.period, sessionBTimeInput, sessionTimezone))
+bool sessionCActive = not na(time(timeframe.period, sessionCTimeInput, sessionTimezone))
+bool sessionDActive = not na(time(timeframe.period, sessionDTimeInput, sessionTimezone))
+
+// =============================================================================================
+// SECTION 15 -- SESSIONS: DASHBOARD
+// =============================================================================================
+int dashboardColumnCount = advancedDashboardInput ? 5 : 2
+int dashboardLastColumn = dashboardColumnCount - 1
+var table dashboardTable = table.new(parsedDashboardPosition, dashboardColumnCount, 7, bgcolor = BACKGROUND, border_width = 0, frame_color = BORDERS, frame_width = 1, force_overlay = true)
+
+if barstate.isfirst and dashboardInput and sessionsTimeframeOk
+    dashboardTable.merge_cells(0, 0, dashboardLastColumn, 0)
+    cell(dashboardTable, 0, 0, "Sessions [LuxAlgo]", textColor = DATA, alignment = text.align_center)
+    divider(dashboardTable, 1, dashboardLastColumn)
+    cell(dashboardTable, 0, 2, "Session", textColor = HEADERS, alignment = text.align_left)
+    cell(dashboardTable, 1, 2, "Status", textColor = HEADERS)
+
+    if advancedDashboardInput
+        cell(dashboardTable, 2, 2, "Trend", textColor = HEADERS)
+        cell(dashboardTable, 3, 2, "Volume", textColor = HEADERS)
+        cell(dashboardTable, 4, 2, "σ", textColor = HEADERS)
+
+    cell(dashboardTable, 0, 3, sessionANameInput, textColor = sessionAColorInput, alignment = text.align_left)
+    cell(dashboardTable, 0, 4, sessionBNameInput, textColor = sessionBColorInput, alignment = text.align_left)
+    cell(dashboardTable, 0, 5, sessionCNameInput, textColor = sessionCColorInput, alignment = text.align_left)
+    cell(dashboardTable, 0, 6, sessionDNameInput, textColor = sessionDColorInput, alignment = text.align_left)
+
+if barstate.islast and dashboardInput and sessionsTimeframeOk
+    string sessionAStatus = effectiveShowSessionA ? (sessionAActive ? "Active" : "Inactive") : "Disabled"
+    string sessionBStatus = effectiveShowSessionB ? (sessionBActive ? "Active" : "Inactive") : "Disabled"
+    string sessionCStatus = effectiveShowSessionC ? (sessionCActive ? "Active" : "Inactive") : "Disabled"
+    string sessionDStatus = effectiveShowSessionD ? (sessionDActive ? "Active" : "Inactive") : "Disabled"
+
+    color sessionAStatusColor = effectiveShowSessionA ? (sessionAActive ? BULL_COLOR : BEAR_COLOR) : HEADERS
+    color sessionBStatusColor = effectiveShowSessionB ? (sessionBActive ? BULL_COLOR : BEAR_COLOR) : HEADERS
+    color sessionCStatusColor = effectiveShowSessionC ? (sessionCActive ? BULL_COLOR : BEAR_COLOR) : HEADERS
+    color sessionDStatusColor = effectiveShowSessionD ? (sessionDActive ? BULL_COLOR : BEAR_COLOR) : HEADERS
+
+    cell(dashboardTable, 1, 3, sessionAStatus, textColor = DATA, background = sessionAStatusColor)
+    cell(dashboardTable, 1, 4, sessionBStatus, textColor = DATA, background = sessionBStatusColor)
+    cell(dashboardTable, 1, 5, sessionCStatus, textColor = DATA, background = sessionCStatusColor)
+    cell(dashboardTable, 1, 6, sessionDStatus, textColor = DATA, background = sessionDStatusColor)
+
+// =============================================================================================
+// SECTION 16 -- SESSIONS: PER-SESSION STATE ENGINE (rebuilt, V2.3)
+// =============================================================================================
+// Why rebuilt rather than patched: the inherited helpers kept running state in function-local
+// `var` variables, and in Pine a function `var` is ONE static instance shared by ALL call sites.
+// Four sessions sharing one accumulator set meant (a) overlapping sessions overwrote each other's
+// range boxes, means, VWAPs and regressions mid-bar, and (b) every session start orphaned the
+// previous box/label/line handles -- they could never be deleted, so the first history replay at
+// or below 30 minutes (where sessionsTimeframeOk opens the gate) drove straight through Pine's
+// 500-per-type drawing-object cap. Each session now owns slot 0..3 in explicit state arrays, and
+// every finished drawing object has a bounded lifetime: retiring into a capped history array with
+// oldest-first deletion, the same discipline the TAD's Bounded Lifetime principle demands.
+
+bool calculateAdvancedDashboard = dashboardInput and advancedDashboardInput and sessionsTimeframeOk
+
+// Plot-feed globals keep their inherited names so Section 17's plots stay byte-identical.
+var float sessionAMaximum = na
+var float sessionAMinimum = na
+var float sessionBMaximum = na
+var float sessionBMinimum = na
+var float sessionCMaximum = na
+var float sessionCMinimum = na
+var float sessionDMaximum = na
+var float sessionDMinimum = na
+var float sessionAVwap = na
+var float sessionBVwap = na
+var float sessionCVwap = na
+var float sessionDVwap = na
+
+// --- 16a. Per-session running state: one slot per session, never shared between them ---
+var array<int>   sessStart  = array.new<int>(4, 0)
+var array<float> sessHigh   = array.new<float>(4, na)
+var array<float> sessLow    = array.new<float>(4, na)
+var array<box>   sessBox    = array.new<box>(4, na)
+var array<label> sessLbl    = array.new<label>(4, na)
+var array<line>  sessTrend  = array.new<line>(4, na)
+var array<line>  sessMeanLn = array.new<line>(4, na)
+var array<int>   sessLen    = array.new<int>(4, 0)      // regression bar count
+var array<int>   sessLenM   = array.new<int>(4, 0)      // mean bar count (independent: the two
+                                                         // features can be toggled separately)
+var array<float> sessCumC   = array.new<float>(4, na)   // regression: sum of closes
+var array<float> sessCumSq  = array.new<float>(4, na)   // regression: sum of squared closes
+var array<float> sessCumW   = array.new<float>(4, na)   // regression: position-weighted closes
+var array<float> sessCumM   = array.new<float>(4, na)   // mean: sum of closes
+var array<float> sessDev    = array.new<float>(4, na)   // regression: latest std deviation
+var array<float> sessCorr   = array.new<float>(4, na)   // regression: latest correlation
+var array<float> sessLinA   = array.new<float>(4, na)   // regression line: start value
+var array<float> sessLinB   = array.new<float>(4, na)   // regression line: end value
+var array<float> sessMeanV  = array.new<float>(4, na)   // running arithmetic mean
+var array<float> sessVNum   = array.new<float>(4, na)   // VWAP numerator
+var array<float> sessVDen   = array.new<float>(4, na)   // VWAP denominator (cumulative volume)
+
+// --- 16b. Bounded history for FINISHED session drawing objects ---
+var array<box>   finishedBoxes  = array.new<box>()
+var array<label> finishedLabels = array.new<label>()
+var array<line>  finishedLines  = array.new<line>()
+
+// Retires a finished object into its capped history, deleting the oldest entry once the cap is
+// exceeded. Only ever called with a handle that is ABOUT TO BE REPLACED by a new session start,
+// so everything sitting in these arrays is, by construction, already complete -- an open object
+// is never deleted out from under its own living session.
+f_retireBox(b) =>
+    array.push(finishedBoxes, b)
+    while array.size(finishedBoxes) > sessionRangeKeepInput
+        box.delete(array.shift(finishedBoxes))
+    true
+
+f_retireLabel(l) =>
+    array.push(finishedLabels, l)
+    while array.size(finishedLabels) > sessionRangeKeepInput
+        label.delete(array.shift(finishedLabels))
+    true
+
+f_retireLine(l) =>
+    array.push(finishedLines, l)
+    while array.size(finishedLines) > sessionLineKeepInput
+        line.delete(array.shift(finishedLines))
+    true
+
+// --- 16c. Per-bar configuration snapshot (plain series arrays, rebuilt each bar) ---
+sessionActiveNow  = array.from(sessionAActive, sessionBActive, sessionCActive, sessionDActive)
+sessionStartedNow = array.from(sessionAActive and not sessionAActive[1], sessionBActive and not sessionBActive[1], sessionCActive and not sessionCActive[1], sessionDActive and not sessionDActive[1])
+sessionEnabledNow = array.from(effectiveShowSessionA, effectiveShowSessionB, effectiveShowSessionC, effectiveShowSessionD)
+sessionNameNow    = array.from(sessionANameInput, sessionBNameInput, sessionCNameInput, sessionDNameInput)
+sessionColorNow   = array.from(sessionAColorInput, sessionBColorInput, sessionCColorInput, sessionDColorInput)
+sessionRangeNow   = array.from(sessionARangeInput, sessionBRangeInput, sessionCRangeInput, sessionDRangeInput)
+sessionTrendNow   = array.from(sessionATrendlineInput, sessionBTrendlineInput, sessionCTrendlineInput, sessionDTrendlineInput)
+sessionMeanNow    = array.from(sessionAMeanInput, sessionBMeanInput, sessionCMeanInput, sessionDMeanInput)
+sessionVwapNow    = array.from(sessionAVwapInput, sessionBVwapInput, sessionCVwapInput, sessionDVwapInput)
+sessionMaxMinNow  = array.from(sessionAMaxMinInput, sessionBMaxMinInput, sessionCMaxMinInput, sessionDMaxMinInput)
+
+// --- 16d. The engine: one pass over the four sessions, each touching only its own slot ---
+for i = 0 to 3
+    bool   enabled = array.get(sessionEnabledNow, i)
+    bool   active  = array.get(sessionActiveNow, i)
+    bool   started = array.get(sessionStartedNow, i)
+    color  sColor  = array.get(sessionColorNow, i)
+    string sName   = array.get(sessionNameNow, i)
+
+    // Feature guards mirror the inherited structure exactly: a feature computes only when the
+    // session is enabled AND at least one consumer (its own overlay, the Max/Min plots, or the
+    // advanced dashboard) actually needs it.
+    bool guardRange = enabled and (array.get(sessionRangeNow, i) or array.get(sessionMaxMinNow, i))
+    bool guardTrend = enabled and (array.get(sessionTrendNow, i) or calculateAdvancedDashboard)
+    bool guardMean  = enabled and array.get(sessionMeanNow, i)
+    bool guardVwap  = enabled and (array.get(sessionVwapNow, i) or calculateAdvancedDashboard)
+
+    // ----- Range box, range label, and the Max/Min plot feed -----
+    if guardRange
+        if started
+            // Retire the previous instance's objects BEFORE overwriting the handles -- this one
+            // step is what closes the unbounded-accumulation leak the inherited code had.
+            if not na(array.get(sessBox, i))
+                f_retireBox(array.get(sessBox, i))
+            if not na(array.get(sessLbl, i))
+                f_retireLabel(array.get(sessLbl, i))
+            array.set(sessStart, i, time)
+            array.set(sessHigh, i, high)
+            array.set(sessLow, i, low)
+            if array.get(sessionRangeNow, i)
+                array.set(sessBox, i, box.new(barNumber, high, barNumber, low, bgcolor = color.new(sColor, rangeTransparencyInput), border_color = showRangeOutlineInput ? sColor : na, border_style = line.style_dotted))
+                if showRangeLabelInput
+                    array.set(sessLbl, i, label.new(time, high, sName, xloc = xloc.bar_time, textcolor = sColor, style = label.style_label_down, color = #00000000, size = size.tiny))
+                else
+                    array.set(sessLbl, i, na)
+            else
+                array.set(sessBox, i, na)
+                array.set(sessLbl, i, na)
+        else if active
+            array.set(sessHigh, i, math.max(high, array.get(sessHigh, i)))
+            array.set(sessLow, i, math.min(low, array.get(sessLow, i)))
+            if not na(array.get(sessBox, i))
+                box.set_top(array.get(sessBox, i), array.get(sessHigh, i))
+                box.set_rightbottom(array.get(sessBox, i), barNumber, array.get(sessLow, i))
+                if not na(array.get(sessLbl, i))
+                    label.set_xy(array.get(sessLbl, i), int(math.avg(array.get(sessStart, i), time)), array.get(sessHigh, i))
+        // Max/Min plot feed: na while the session is still forming (the linebr gap), then the
+        // frozen extreme afterwards -- the inherited "extend until the next session begins".
+        float mmH = active ? na : array.get(sessHigh, i)
+        float mmL = active ? na : array.get(sessLow, i)
+        if i == 0
+            sessionAMaximum := mmH
+            sessionAMinimum := mmL
+        else if i == 1
+            sessionBMaximum := mmH
+            sessionBMinimum := mmL
+        else if i == 2
+            sessionCMaximum := mmH
+            sessionCMinimum := mmL
+        else
+            sessionDMaximum := mmH
+            sessionDMinimum := mmL
+
+    // ----- Linear-regression trendline (and the dashboard's Trend / sigma cells) -----
+    if guardTrend
+        if started
+            if not na(array.get(sessTrend, i))
+                f_retireLine(array.get(sessTrend, i))
+            array.set(sessLen, i, 1)
+            array.set(sessCumC, i, close)
+            array.set(sessCumSq, i, close * close)
+            array.set(sessCumW, i, close)
+            array.set(sessDev, i, 0.0)
+            array.set(sessCorr, i, na)
+            array.set(sessLinA, i, close)
+            array.set(sessLinB, i, close)
+            array.set(sessTrend, i, line.new(barNumber, close, barNumber, close, color = sColor))
+        else if active
+            int   len   = array.get(sessLen, i) + 1
+            float cumC  = array.get(sessCumC, i) + close
+            float cumSq = array.get(sessCumSq, i) + close * close
+            float cumW  = array.get(sessCumW, i) + close * len
+            array.set(sessLen, i, len)
+            array.set(sessCumC, i, cumC)
+            array.set(sessCumSq, i, cumSq)
+            array.set(sessCumW, i, cumW)
+            float average         = cumC / len
+            float weightedAverage = cumW / (len * (len + 1) / 2.0)
+            float covariance      = (weightedAverage - average) * (len + 1) / 2.0
+            float variance        = math.max(cumSq / len - average * average, 0.0)
+            float corrDen         = math.sqrt(variance) * (math.sqrt(len * len - 1.0) / (2.0 * math.sqrt(3.0)))
+            array.set(sessDev, i, math.sqrt(variance))
+            array.set(sessCorr, i, corrDen != 0.0 ? covariance / corrDen : na)
+            float firstV = 4.0 * average - 3.0 * weightedAverage
+            float lastV  = 3.0 * weightedAverage - 2.0 * average
+            array.set(sessLinA, i, firstV)
+            array.set(sessLinB, i, lastV)
+            if not na(array.get(sessTrend, i))
+                line.set_y1(array.get(sessTrend, i), firstV)
+                line.set_xy2(array.get(sessTrend, i), barNumber, lastV)
+
+    // ----- Running arithmetic mean -----
+    if guardMean
+        if started
+            if not na(array.get(sessMeanLn, i))
+                f_retireLine(array.get(sessMeanLn, i))
+            array.set(sessLenM, i, 1)
+            array.set(sessCumM, i, close)
+            array.set(sessMeanV, i, close)
+            array.set(sessMeanLn, i, line.new(barNumber, close, barNumber, close, color = sColor))
+        else if active
+            int   lenM = array.get(sessLenM, i) + 1
+            float cumM = array.get(sessCumM, i) + close
+            array.set(sessLenM, i, lenM)
+            array.set(sessCumM, i, cumM)
+            float avgM = cumM / lenM
+            array.set(sessMeanV, i, avgM)
+            if not na(array.get(sessMeanLn, i))
+                line.set_y1(array.get(sessMeanLn, i), avgM)
+                line.set_xy2(array.get(sessMeanLn, i), barNumber, avgM)
+
+    // ----- Session VWAP (plot feed + dashboard Volume cell) -----
+    if guardVwap
+        if started
+            array.set(sessVNum, i, close * volume)
+            array.set(sessVDen, i, volume)
+        else if active
+            array.set(sessVNum, i, array.get(sessVNum, i) + close * volume)
+            array.set(sessVDen, i, array.get(sessVDen, i) + volume)
+        else
+            // Inactive: numerator resets so the plotted VWAP goes na after the session ends,
+            // exactly as the inherited helper behaved; the denominator deliberately stays put so
+            // the dashboard's cumulative-volume cell keeps showing the finished session's total.
+            array.set(sessVNum, i, na)
+        if array.get(sessionVwapNow, i)
+            float vwapVal = array.get(sessVDen, i) != 0.0 ? array.get(sessVNum, i) / array.get(sessVDen, i) : na
+            if i == 0
+                sessionAVwap := vwapVal
+            else if i == 1
+                sessionBVwap := vwapVal
+            else if i == 2
+                sessionCVwap := vwapVal
+            else
+                sessionDVwap := vwapVal
+
+// --- 16e. Advanced dashboard data cells ---
+// Written once on the last bar instead of every bar: the table persists between bars, so the
+// visible result is identical and the per-bar cell-write cost disappears. Rows 3..6 are sessions
+// A..D, matching the header block built in Section 15.
+if barstate.islast and calculateAdvancedDashboard
+    for i = 0 to 3
+        if array.get(sessionEnabledNow, i)
+            color trendColor = na(array.get(sessCorr, i)) ? na : array.get(sessCorr, i) >= 0.0 ? BULL_COLOR : BEAR_COLOR
+            cell(dashboardTable, 2, 3 + i, str.tostring(array.get(sessCorr, i), "#.##"), textColor = DATA, background = trendColor)
+            cell(dashboardTable, 3, 3 + i, str.tostring(array.get(sessVDen, i), format.volume), textColor = DATA)
+            cell(dashboardTable, 4, 3 + i, str.tostring(array.get(sessDev, i), "#.####"), textColor = DATA)
+
+// =============================================================================================
+// SECTION 17 -- SESSIONS: PLOTS & DIVIDERS
+// =============================================================================================
+plot(effectiveShowSessionA and sessionAMaxMinInput ? sessionAMaximum : na, "Session A Maximum", sessionAColorInput, 1, plot.style_linebr)
+plot(effectiveShowSessionA and sessionAMaxMinInput ? sessionAMinimum : na, "Session A Minimum", sessionAColorInput, 1, plot.style_linebr)
+plot(effectiveShowSessionB and sessionBMaxMinInput ? sessionBMaximum : na, "Session B Maximum", sessionBColorInput, 1, plot.style_linebr)
+plot(effectiveShowSessionB and sessionBMaxMinInput ? sessionBMinimum : na, "Session B Minimum", sessionBColorInput, 1, plot.style_linebr)
+plot(effectiveShowSessionC and sessionCMaxMinInput ? sessionCMaximum : na, "Session C Maximum", sessionCColorInput, 1, plot.style_linebr)
+plot(effectiveShowSessionC and sessionCMaxMinInput ? sessionCMinimum : na, "Session C Minimum", sessionCColorInput, 1, plot.style_linebr)
+plot(effectiveShowSessionD and sessionDMaxMinInput ? sessionDMaximum : na, "Session D Maximum", sessionDColorInput, 1, plot.style_linebr)
+plot(effectiveShowSessionD and sessionDMaxMinInput ? sessionDMinimum : na, "Session D Minimum", sessionDColorInput, 1, plot.style_linebr)
+
+plot(sessionAVwapInput ? sessionAVwap : na, "Session A VWAP", sessionAColorInput, 1, plot.style_linebr)
+plot(sessionBVwapInput ? sessionBVwap : na, "Session B VWAP", sessionBColorInput, 1, plot.style_linebr)
+plot(sessionCVwapInput ? sessionCVwap : na, "Session C VWAP", sessionCColorInput, 1, plot.style_linebr)
+plot(sessionDVwapInput ? sessionDVwap : na, "Session D VWAP", sessionDColorInput, 1, plot.style_linebr)
+
+plotshape(sessionAActive and effectiveShowSessionDivider and effectiveShowSessionA, title = "Session A Active", style = shape.square, location = location.bottom, color = na, text = ".", textcolor = sessionAColorInput, size = size.tiny, display = display.all - display.status_line, editable = false)
+plotshape(sessionAActive != sessionAActive[1] and effectiveShowSessionDivider and effectiveShowSessionA, title = "Session A Boundary", style = shape.labelup, location = location.bottom, color = na, text = "❚", textcolor = sessionAColorInput, size = size.tiny, display = display.all - display.status_line, editable = false)
+
+plotshape(sessionBActive and effectiveShowSessionDivider and effectiveShowSessionB, title = "Session B Active", style = shape.labelup, location = location.bottom, color = na, text = ".", textcolor = sessionBColorInput, size = size.tiny, display = display.all - display.status_line, editable = false)
+plotshape(sessionBActive != sessionBActive[1] and effectiveShowSessionDivider and effectiveShowSessionB, title = "Session B Boundary", style = shape.labelup, location = location.bottom, color = na, text = "❚", textcolor = sessionBColorInput, size = size.tiny, display = display.all - display.status_line, editable = false)
+
+plotshape(sessionCActive and effectiveShowSessionDivider and effectiveShowSessionC, title = "Session C Active", style = shape.square, location = location.bottom, color = na, text = ".", textcolor = sessionCColorInput, size = size.tiny, display = display.all - display.status_line, editable = false)
+plotshape(sessionCActive != sessionCActive[1] and effectiveShowSessionDivider and effectiveShowSessionC, title = "Session C Boundary", style = shape.labelup, location = location.bottom, color = na, text = "❚", textcolor = sessionCColorInput, size = size.tiny, display = display.all - display.status_line, editable = false)
+
+plotshape(sessionDActive and effectiveShowSessionDivider and effectiveShowSessionD, title = "Session D Active", style = shape.labelup, location = location.bottom, color = na, text = ".", textcolor = sessionDColorInput, size = size.tiny, display = display.all - display.status_line, editable = false)
+plotshape(sessionDActive != sessionDActive[1] and effectiveShowSessionDivider and effectiveShowSessionD, title = "Session D Boundary", style = shape.labelup, location = location.bottom, color = na, text = "❚", textcolor = sessionDColorInput, size = size.tiny, display = display.all - display.status_line, editable = false)
+
+// =============================================================================================
+// SECTION 18 -- PERIOD DIVIDERS (rebuilt)
+// =============================================================================================
+// Replaces the original LuxAlgo daily-divider block, which drew a dashed line plus a weekday
+// label but was gated by sessionsTimeframeOk -- so it silently did nothing on any chart above 30
+// minutes. That cutoff is correct for intraday session shading and wrong for period dividers;
+// nothing in this section references it.
+//
+// Five period types, each independently toggleable, all sharing one lookback count expressed in
+// that type's own units: set 20, and Daily keeps the last 20 days while Weekly keeps the last 20
+// weeks. Each type owns its own array so the counts never interfere with each other.
+//
+// Bounded Lifetime: every divider is a line plus an optional label, both held on the Divider UDT
+// so they share one lifecycle. The moment an array exceeds the lookback, its oldest entry is
+// deleted outright -- line and label together -- which caps total drawing-object usage at
+// (lookback x 5 x 2) regardless of how long the chart runs.
+var array<Divider> div4h      = array.new<Divider>()
+var array<Divider> divDaily   = array.new<Divider>()
+var array<Divider> divWeekly  = array.new<Divider>()
+var array<Divider> divMonthly = array.new<Divider>()
+var array<Divider> divQuarter = array.new<Divider>()
+
+dividerRenderColor = color.new(dividerColorInput, 100 - dividerOpacityInput)
+
+// Reference height for labels. Pine cannot read the actual viewport, so the top/bottom of recent
+// price action stands in for "top/bottom of the chart" -- close enough visually, and it scrolls
+// naturally with price instead of drifting off-screen.
+divHiRef  = ta.highest(high, 200)
+divLoRef  = ta.lowest(low, 200)
+divSpan   = nz(divHiRef - divLoRef, 0)
+divLabelY = dividerLabelPosInput == "Bottom" ? nz(divLoRef, close) - divSpan * 0.03 : nz(divHiRef, close) + divSpan * 0.03
+
+// A vertical line is drawn as a near-zero-height segment with extend.both, which stretches it to
+// fill the chart's full height at any zoom level.
+f_pushDivider(array<Divider> arr, string labelText, float labelY) =>
+    dl = line.new(x1 = time, y1 = close, x2 = time, y2 = close + syminfo.mintick, xloc = xloc.bar_time, extend = extend.both, color = dividerRenderColor, style = line.style_dashed, width = 1)
+    label lb = na
+    if dividerLabelPosInput != "None"
+        lb := label.new(x = time, y = labelY, text = labelText, xloc = xloc.bar_time, yloc = yloc.price, style = label.style_none, textcolor = dividerRenderColor, size = size.small)
+    array.push(arr, Divider.new(lineId = dl, labelId = lb))
+    while array.size(arr) > dividerLookbackInput
+        oldDiv = array.shift(arr)
+        if not na(oldDiv.lineId)
+            line.delete(oldDiv.lineId)
+        if not na(oldDiv.labelId)
+            label.delete(oldDiv.labelId)
+    true
+
+// Each label was created using the reference height as it stood on its own bar, so without this
+// they would sit at slightly different heights and look ragged. Realigning them all on the final
+// bar puts every visible label in one clean row. Only runs on the last bar -- doing it on every
+// historical bar would repeat the same work thousands of times for no visible benefit.
+f_alignDividerLabels(array<Divider> arr, float y) =>
+    for d in arr
+        if not na(d.labelId)
+            label.set_y(d.labelId, y)
+    true
+
+// A divider is only meaningful when the chart is STRICTLY below its period: on a 4H chart every
+// bar starts a new 4H period, which would draw a divider on literally every candle.
+chartSeconds   = timeframe.in_seconds()
+canShow4h      = chartSeconds < timeframe.in_seconds("240")
+canShowDaily   = chartSeconds < timeframe.in_seconds("1D")
+canShowWeekly  = chartSeconds < timeframe.in_seconds("1W")
+canShowMonthly = chartSeconds < timeframe.in_seconds("1M")
+canShowQuarter = chartSeconds < timeframe.in_seconds("3M")
+
+// Period-rollover detection: time(tf) returns the opening timestamp of the period the current bar
+// belongs to, so a change in that value is exactly the moment a new period begins.
+t4h      = time("240")
+tDaily   = time("1D")
+tWeekly  = time("1W")
+tMonthly = time("1M")
+tQuarter = time("3M")
+
+newPeriod4h      = not na(t4h)      and t4h      != t4h[1]
+newPeriodDaily   = not na(tDaily)   and tDaily   != tDaily[1]
+newPeriodWeekly  = not na(tWeekly)  and tWeekly  != tWeekly[1]
+newPeriodMonthly = not na(tMonthly) and tMonthly != tMonthly[1]
+newPeriodQuarter = not na(tQuarter) and tQuarter != tQuarter[1]
+
+if showDiv4hInput and canShow4h and newPeriod4h
+    f_pushDivider(div4h, "4H", divLabelY)
+
+if showDivDailyInput and canShowDaily and newPeriodDaily
+    f_pushDivider(divDaily, "Daily", divLabelY)
+
+if showDivWeeklyInput and canShowWeekly and newPeriodWeekly
+    f_pushDivider(divWeekly, "Weekly", divLabelY)
+
+if showDivMonthlyInput and canShowMonthly and newPeriodMonthly
+    f_pushDivider(divMonthly, "Monthly", divLabelY)
+
+if showDivQuarterInput and canShowQuarter and newPeriodQuarter
+    f_pushDivider(divQuarter, "Quarterly", divLabelY)
+
+if barstate.islast and dividerLabelPosInput != "None"
+    f_alignDividerLabels(div4h, divLabelY)
+    f_alignDividerLabels(divDaily, divLabelY)
+    f_alignDividerLabels(divWeekly, divLabelY)
+    f_alignDividerLabels(divMonthly, divLabelY)
+    f_alignDividerLabels(divQuarter, divLabelY)

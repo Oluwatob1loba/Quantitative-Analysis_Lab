@@ -1,0 +1,803 @@
+// RIGEL NOIR V3 Phase 1 refined 3 October 2026. Integrated extension of the supplied approved V2.3 implementation.
+// Authoritative rules and documented changes: TAD_V2_3.md and TAD_V3_Phase1.md.
+// Structural closes are native-confirmed; developing HTF packets are display-only.
+//@version=6
+indicator("RIGEL NOIR SPATIAL", shorttitle = "RINO XD", overlay = true, max_bars_back = 5000, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500)
+
+// =============================================================================================
+// SECTION 1 -- INPUTS / UI MATRIX (Market Structure)
+// =============================================================================================
+string layerEnableTooltip    = "Show or hide this layer's levels on the chart."
+string layerTimeframeTooltip = "The higher timeframe this layer's structure is calculated from."
+string lineWidthTooltip      = "Thickness of this layer's drawn levels, in pixels."
+
+tf1Input          = input.timeframe("1W", "Timeframe", group = "TF1 - Macro Layer", inline = "tf1Main", tooltip = "Default: 1W. Choose the timeframe for the larger candle ranges and the setup engine.")
+tf2Input          = input.timeframe("1D", "Timeframe", group = "TF2 - Structure Layer", inline = "tf2Main", tooltip = "Default: 1D. Choose the timeframe for swing structure; use a timeframe at or above the chart and at or below TF1.")
+
+// V3 configuration stays separate from the V2 trading state and display families.
+v3PanelInput = input.bool(true, "Enable HTF candle panel", group = "HTF Candles", tooltip = "Default: on. Show or hide the higher timeframe candles beside the chart.")
+v3PanelLimitInput = input.int(4, "Next eligible groups", minval = 1, maxval = 6, group = "HTF Candles", tooltip = "Default: 4. Show at most this many enabled timeframes above the chart; slot order decides which groups appear.")
+v3Panel1On = input.bool(true, "HTF 1", group = "HTF Candles", inline = "p1", tooltip = "Default: on. Enable this panel slot; only timeframes above the chart are drawn.")
+v3Panel1Tf = input.timeframe("60", "TF", group = "HTF Candles", inline = "p1", tooltip = "Default: 60. Choose this panel timeframe; values at or below the chart are skipped.")
+v3Panel1Count = input.int(24, "Candles", minval = 1, maxval = 40, group = "HTF Candles", inline = "p1", tooltip = "Default: 24. Keep up to this many candles in this group; shared drawing limits can reduce the displayed count.")
+v3Panel1Label = input.string("", "HTF 1 label override", group = "HTF Candles", tooltip = "Default: blank. Enter a custom group name; a blank value keeps the timeframe name.")
+v3Panel2On = input.bool(true, "HTF 2", group = "HTF Candles", inline = "p2", tooltip = "Default: on. Enable this panel slot; only timeframes above the chart are drawn.")
+v3Panel2Tf = input.timeframe("240", "TF", group = "HTF Candles", inline = "p2", tooltip = "Default: 240. Choose this panel timeframe; values at or below the chart are skipped.")
+v3Panel2Count = input.int(30, "Candles", minval = 1, maxval = 40, group = "HTF Candles", inline = "p2", tooltip = "Default: 30. Keep up to this many candles in this group; shared drawing limits can reduce the displayed count.")
+v3Panel2Label = input.string("", "HTF 2 label override", group = "HTF Candles", tooltip = "Default: blank. Enter a custom group name; a blank value keeps the timeframe name.")
+v3Panel3On = input.bool(true, "HTF 3", group = "HTF Candles", inline = "p3", tooltip = "Default: on. Enable this panel slot; only timeframes above the chart are drawn.")
+v3Panel3Tf = input.timeframe("1D", "TF", group = "HTF Candles", inline = "p3", tooltip = "Default: 1D. Choose this panel timeframe; values at or below the chart are skipped.")
+v3Panel3Count = input.int(20, "Candles", minval = 1, maxval = 40, group = "HTF Candles", inline = "p3", tooltip = "Default: 20. Keep up to this many candles in this group; shared drawing limits can reduce the displayed count.")
+v3Panel3Label = input.string("", "HTF 3 label override", group = "HTF Candles", tooltip = "Default: blank. Enter a custom group name; a blank value keeps the timeframe name.")
+v3Panel4On = input.bool(true, "HTF 4", group = "HTF Candles", inline = "p4", tooltip = "Default: on. Enable this panel slot; only timeframes above the chart are drawn.")
+v3Panel4Tf = input.timeframe("1W", "TF", group = "HTF Candles", inline = "p4", tooltip = "Default: 1W. Choose this panel timeframe; values at or below the chart are skipped.")
+v3Panel4Count = input.int(12, "Candles", minval = 1, maxval = 40, group = "HTF Candles", inline = "p4", tooltip = "Default: 12. Keep up to this many candles in this group; shared drawing limits can reduce the displayed count.")
+v3Panel4Label = input.string("", "HTF 4 label override", group = "HTF Candles", tooltip = "Default: blank. Enter a custom group name; a blank value keeps the timeframe name.")
+v3Panel5On = input.bool(true, "HTF 5", group = "HTF Candles", inline = "p5", tooltip = "Default: on. Enable this panel slot; only timeframes above the chart are drawn.")
+v3Panel5Tf = input.timeframe("1M", "TF", group = "HTF Candles", inline = "p5", tooltip = "Default: 1M. Choose this panel timeframe; values at or below the chart are skipped.")
+v3Panel5Count = input.int(9, "Candles", minval = 1, maxval = 40, group = "HTF Candles", inline = "p5", tooltip = "Default: 9. Keep up to this many candles in this group; shared drawing limits can reduce the displayed count.")
+v3Panel5Label = input.string("", "HTF 5 label override", group = "HTF Candles", tooltip = "Default: blank. Enter a custom group name; a blank value keeps the timeframe name.")
+v3Panel6On = input.bool(true, "HTF 6", group = "HTF Candles", inline = "p6", tooltip = "Default: on. Enable this panel slot; only timeframes above the chart are drawn.")
+v3Panel6Tf = input.timeframe("3M", "TF", group = "HTF Candles", inline = "p6", tooltip = "Default: 3M. Choose this panel timeframe; values at or below the chart are skipped.")
+v3Panel6Count = input.int(8, "Candles", minval = 1, maxval = 40, group = "HTF Candles", inline = "p6", tooltip = "Default: 8. Keep up to this many candles in this group; shared drawing limits can reduce the displayed count.")
+v3Panel6Label = input.string("", "HTF 6 label override", group = "HTF Candles", tooltip = "Default: blank. Enter a custom group name; a blank value keeps the timeframe name.")
+v3PanelPaddingInput = input.int(15, "Padding from chart", minval = 1, maxval = 200, group = "HTF Layout", tooltip = "Default: 15. Move the panel farther right using this many nominal chart periods.")
+v3PanelSpaceInput = input.int(1, "Space between candles", minval = 0, maxval = 20, group = "HTF Layout", tooltip = "Default: 1. Set the horizontal gap between candle bodies in nominal chart periods.")
+v3PanelGroupSpaceInput = input.int(10, "Space between groups", minval = 1, maxval = 100, group = "HTF Layout", tooltip = "Default: 10. Set the horizontal gap between timeframe groups in nominal chart periods.")
+v3PanelWidthInput = input.int(2, "Candle width", minval = 1, maxval = 10, group = "HTF Layout", tooltip = "Default: 2. Body width in chart bars under Fixed width mode; uniform across all groups, mimicking regular candles like the reference indicator.")
+v3PanelWidthModeInput = input.string("Fixed width", "Candle width mode", options = ["Native proportional", "Fixed width"], group = "HTF Layout", tooltip = "Default: Fixed width. Every HTF candle in every group gets the same body width (reference behaviour). Native proportional scales each group by its true span, which makes month/quarter bodies very wide; kept only as an option.")
+v3PanelBullBody = input.color(#75b5ad, "Bull body", group = "HTF Style", inline = "pb", tooltip = "Default: #75b5ad placeholder. Choose the color and transparency of bull body; calculations stay unchanged.")
+v3PanelBearBody = input.color(#9b779d, "Bear body", group = "HTF Style", inline = "pb", tooltip = "Default: #9b779d placeholder. Choose the color and transparency of bear body; calculations stay unchanged.")
+v3PanelBullBorder = input.color(#568f88, "Bull border", group = "HTF Style", inline = "pbr", tooltip = "Default: #568f88 placeholder. Choose the color and transparency of bull border; calculations stay unchanged.")
+v3PanelBearBorder = input.color(#7b597d, "Bear border", group = "HTF Style", inline = "pbr", tooltip = "Default: #7b597d placeholder. Choose the color and transparency of bear border; calculations stay unchanged.")
+v3PanelBullWick = input.color(#568f88, "Bull wick", group = "HTF Style", inline = "pw", tooltip = "Default: #568f88 placeholder. Choose the color and transparency of bull wick; calculations stay unchanged.")
+v3PanelBearWick = input.color(#7b597d, "Bear wick", group = "HTF Style", inline = "pw", tooltip = "Default: #7b597d placeholder. Choose the color and transparency of bear wick; calculations stay unchanged.")
+v3PanelLabelInput = input.bool(true, "HTF label", group = "HTF Labels", tooltip = "Default: on. Show each group timeframe name or custom label.")
+v3PanelLabelPosInput = input.string("Top", "Label position", options = ["Top", "Bottom"], group = "HTF Labels", tooltip = "Default: Top. Put group text above or below the displayed candles.")
+v3PanelLabelAlignInput = input.bool(true, "Align label rows", group = "HTF Labels", tooltip = "Default: on. Align group labels on one shared row; turn off to use each group high or low.")
+v3PanelLabelColorInput = input.color(#787B86, "Text color", group = "HTF Labels", tooltip = "Default: #787B86 placeholder. Choose the color and transparency of text color; calculations stay unchanged.")
+v3PanelLabelSizeInput = input.string("Small", "Text size", options = ["Tiny", "Small", "Normal"], group = "HTF Labels", tooltip = "Default: Small. Choose the size of this display text.")
+v3PanelTimerInput = input.bool(true, "Remaining time", group = "HTF Labels", tooltip = "Default: on. Show the live time remaining; unavailable or closed-market countdowns show n/a.")
+v3PanelFvgInput = input.bool(true, "Panel FVG", group = "HTF Imbalances", tooltip = "Default: on. Show confirmed unfilled three-candle gaps on the candle panel.")
+v3PanelFvgFillInput = input.color(color.new(#787B86, 85), "Panel gap fill", group = "HTF Imbalances", tooltip = "Default: #787B86, 45 placeholder. Choose the color and transparency of panel gap fill; calculations stay unchanged.")
+v3PanelFvgBorderInput = input.color(color.new(#787B86, 80), "Panel gap border", group = "HTF Imbalances", tooltip = "Default: #787B86, 10 placeholder. Choose the color and transparency of panel gap border; calculations stay unchanged.")
+v3PanelViFillInput = input.color(color.new(#F23645, 85), "Panel imbalance fill", group = "HTF Imbalances", tooltip = "Default: #F23645, 45 placeholder. Choose the color and transparency of panel imbalance fill; calculations stay unchanged.")
+v3PanelViBorderInput = input.color(color.new(#F23645, 80), "Panel imbalance border", group = "HTF Imbalances", tooltip = "Default: #F23645, 10 placeholder. Choose the color and transparency of panel imbalance border; calculations stay unchanged.")
+v3PanelViInput = input.bool(false, "Panel volume imbalance", group = "HTF Imbalances", tooltip = "Default: off. Show confirmed unfilled overlapping-wick body gaps on the candle panel.")
+v3ViWickExtendInput = input.bool(false, "Extend panel imbalances into overlapping wicks", group = "HTF Imbalances", tooltip = "Default: off. Expand each panel body-gap imbalance to include the shared wick interval; turn off to keep body-gap bounds.")
+v3PanelTraceInput = input.bool(false, "Trace lines", group = "HTF Trace", tooltip = "Default: off. Draw opening, closing, highest and lowest prices from a selected panel group back to its native origin.")
+v3PanelTraceAnchorInput = input.string("Last Timeframe", "Anchor to", options = ["First Timeframe", "Last Timeframe"], group = "HTF Trace", tooltip = "Default: Last Timeframe. Use the first or last visible timeframe group for the four trace prices.")
+v3PanelPriceInput = input.bool(false, "Trace price labels", group = "HTF Trace", tooltip = "Default: off. Show numeric prices beside the four trace lines.")
+v3TraceOpenColor = input.color(#787B86, "Open", group = "HTF Trace", inline = "tro", tooltip = "Default: #787B86 placeholder. Choose the color and transparency of open; calculations stay unchanged.")
+v3TraceOpenStyle = input.string("Dotted", "Style", options = ["Solid", "Dotted", "Dashed"], group = "HTF Trace", inline = "tro", tooltip = "Default: Dotted. Choose a solid, dotted or dashed line.")
+v3TraceOpenWidth = input.int(2, "Width", minval = 1, maxval = 4, group = "HTF Trace", inline = "tro", tooltip = "Default: 2. Set this line thickness in pixels.")
+v3TraceCloseColor = input.color(#787B86, "Close", group = "HTF Trace", inline = "trc", tooltip = "Default: #787B86 placeholder. Choose the color and transparency of close; calculations stay unchanged.")
+v3TraceCloseStyle = input.string("Dotted", "Style", options = ["Solid", "Dotted", "Dashed"], group = "HTF Trace", inline = "trc", tooltip = "Default: Dotted. Choose a solid, dotted or dashed line.")
+v3TraceCloseWidth = input.int(1, "Width", minval = 1, maxval = 4, group = "HTF Trace", inline = "trc", tooltip = "Default: 1. Set this line thickness in pixels.")
+v3TraceHighColor = input.color(#787B86, "High", group = "HTF Trace", inline = "trh", tooltip = "Default: #787B86 placeholder. Choose the color and transparency of high; calculations stay unchanged.")
+v3TraceHighStyle = input.string("Dotted", "Style", options = ["Solid", "Dotted", "Dashed"], group = "HTF Trace", inline = "trh", tooltip = "Default: Dotted. Choose a solid, dotted or dashed line.")
+v3TraceHighWidth = input.int(1, "Width", minval = 1, maxval = 4, group = "HTF Trace", inline = "trh", tooltip = "Default: 1. Set this line thickness in pixels.")
+v3TraceLowColor = input.color(#787B86, "Low", group = "HTF Trace", inline = "trl", tooltip = "Default: #787B86 placeholder. Choose the color and transparency of low; calculations stay unchanged.")
+v3TraceLowStyle = input.string("Dotted", "Style", options = ["Solid", "Dotted", "Dashed"], group = "HTF Trace", inline = "trl", tooltip = "Default: Dotted. Choose a solid, dotted or dashed line.")
+v3TraceLowWidth = input.int(1, "Width", minval = 1, maxval = 4, group = "HTF Trace", inline = "trl", tooltip = "Default: 1. Set this line thickness in pixels.")
+
+
+// =============================================================================================
+// SECTION 3 -- HELPER FUNCTIONS (Market Structure)
+// =============================================================================================
+f_v3TfRank(string period) =>
+    tf = period == "" ? timeframe.period : period
+    last = str.substring(tf, str.length(tf)-1, str.length(tf))
+    hasUnit = last == "S" or last == "D" or last == "W" or last == "M" or last == "T"
+    numberText = hasUnit ? str.substring(tf, 0, str.length(tf)-1) : tf
+    multiplier = numberText == "" ? 1.0 : str.tonumber(numberText)
+    scale = last == "S" ? 1.0/86400.0 : last == "D" ? 1.0 : last == "W" ? 7.0 : last == "M" ? 30.4375 : last == "T" ? float(na) : 1.0/1440.0
+    not na(multiplier) and multiplier > 0 ? multiplier * scale : float(na)
+f_v3TfKey(string period) =>
+    tf = period == "" ? timeframe.period : period
+    last = str.substring(tf, str.length(tf)-1, str.length(tf))
+    hasUnit = last == "S" or last == "D" or last == "W" or last == "M" or last == "T"
+    numberText = hasUnit ? str.substring(tf, 0, str.length(tf)-1) : tf
+    multiplier = numberText == "" ? 1.0 : str.tonumber(numberText)
+    str.tostring(multiplier, "#") + (hasUnit ? last : "min")
+f_v3TfLe(string lower, string upper) =>
+    a = f_v3TfRank(lower)
+    b = f_v3TfRank(upper)
+    not na(a) and not na(b) and a <= b
+f_v3TfName(string period) =>
+    tf = period == "" ? timeframe.period : period
+    last = str.substring(tf, str.length(tf)-1, str.length(tf))
+    hasUnit = last == "S" or last == "D" or last == "W" or last == "M" or last == "T"
+    numberText = hasUnit ? str.substring(tf, 0, str.length(tf)-1) : tf
+    mult = numberText == "" ? 1.0 : str.tonumber(numberText)
+    result = tf
+    if not hasUnit
+        result := mult < 60 ? "M" + str.tostring(mult, "#") : "H" + str.tostring(mult / 60, "#")
+    else if last == "S"
+        result := str.tostring(mult, "#") + "S"
+    else if last == "D"
+        result := (mult == 1 ? "" : str.tostring(mult, "#")) + "D"
+    else if last == "W"
+        result := (mult == 1 ? "" : str.tostring(mult, "#")) + "W"
+    else if last == "M"
+        result := (mult == 1 ? "" : str.tostring(mult, "#")) + "M"
+    result
+f_v3Size(string selection) =>
+    selection == "Normal" ? size.normal : selection == "Small" ? size.small : size.tiny
+f_v3Style(string selection) =>
+    selection == "Solid" ? line.style_solid : selection == "Dashed" ? line.style_dashed : line.style_dotted
+f_v3Room(int linesNeeded, int boxesNeeded, int labelsNeeded) =>
+    array.size(line.all) + linesNeeded < 490 and array.size(box.all) + boxesNeeded < 490 and array.size(label.all) + labelsNeeded < 490
+
+var array<line> v3PanelLines = array.new<line>()
+var array<box> v3PanelBoxes = array.new<box>()
+var array<label> v3PanelLabels = array.new<label>()
+if barstate.islast
+    for handle in v3PanelLines
+        line.delete(handle)
+    for handle in v3PanelBoxes
+        box.delete(handle)
+    for handle in v3PanelLabels
+        label.delete(handle)
+    array.clear(v3PanelLines)
+    array.clear(v3PanelBoxes)
+    array.clear(v3PanelLabels)
+
+// =============================================================================================
+// SECTION 4-mini -- SPATIAL ROLL DETECTION (display-only; no structure state lives here)
+// =============================================================================================
+[tf1H, tf1L, tf1ClosedT, tf1ClosedEnd] = request.security(syminfo.tickerid, tf1Input, [high[1], low[1], time[1], time_close[1]], lookahead = barmerge.lookahead_on)
+[tf2ClosedT, tf2ClosedEnd] = request.security(syminfo.tickerid, tf2Input, [time[1], time_close[1]], lookahead = barmerge.lookahead_on)
+newTf1Bar = f_v3TfLe(timeframe.period, tf1Input) and not na(tf1ClosedT) and tf1ClosedT != tf1ClosedT[1]
+newTf2Bar = f_v3TfLe(timeframe.period, tf2Input) and not na(tf2ClosedT) and tf2ClosedT != tf2ClosedT[1]
+showTf1 = f_v3TfLe(timeframe.period, tf1Input)
+showTf2 = f_v3TfLe(timeframe.period, tf2Input)
+
+// =============================================================================================
+// SECTION 9B -- MOVING AVERAGE OVERLAYS (TEMA & SMA)
+// =============================================================================================
+maEnableInput  = input.bool(true, "Enable", group = "MA Overlays", tooltip = "Default: on. Show or hide the existing moving-average overlays; they do not gate setups.")
+maSmoothInput  = input.bool(true, "Smooth (scale length to chart timeframe)", group = "MA Overlays", tooltip = "Default: on. Use a chart-based approximation for smoother averages; turn off for native-timeframe calculations.")
+emaAnchorInput = input.timeframe("1D", "TEMA anchor timeframe", group = "MA Overlays", tooltip = "Default: 1D. Choose the shared timeframe used by the Triple EMAs.")
+ema1LenInput   = input.int(10, "TEMA 1 Length", minval = 1, group = "MA Overlays", inline = "ema1", tooltip = "Default: 10.")
+ema1SrcInput   = input.source(close, "Source", group = "MA Overlays", inline = "ema1", tooltip = "Default: close price.")
+ema1Color      = input.color(#2962FF, "Color", group = "MA Overlays", inline = "ema1", tooltip = "Default: #2962FF placeholder.")
+ema2LenInput   = input.int(20, "TEMA 2 Length", minval = 1, group = "MA Overlays", inline = "ema2", tooltip = "Default: 20.")
+ema2SrcInput   = input.source(close, "Source", group = "MA Overlays", inline = "ema2", tooltip = "Default: close price.")
+ema2Color      = input.color(#FF6D00, "Color", group = "MA Overlays", inline = "ema2", tooltip = "Default: #FF6D00 placeholder.")
+ema3LenInput    = input.int(40, "TEMA 3 Length", minval = 1, group = "MA Overlays", inline = "ema3", tooltip = "Default: 40.")
+ema3SrcInput    = input.source(close, "Source", group = "MA Overlays", inline = "ema3", tooltip = "Default: close price.")
+ema3Color       = input.color(#787B86, "Color", group = "MA Overlays", inline = "ema3", tooltip = "Default: #787B86 placeholder.")
+ema4LenInput    = input.int(60, "TEMA 4 Length", minval = 1, group = "MA Overlays", inline = "ema4", tooltip = "Default: 60.")
+ema4SrcInput    = input.source(close, "Source", group = "MA Overlays", inline = "ema4", tooltip = "Default: close price.")
+ema4Color       = input.color(#c84a9a, "Color", group = "MA Overlays", inline = "ema4", tooltip = "Default: #c84a9a placeholder.")
+
+smaAnchorInput = input.timeframe("1D", "SMA anchor timeframe", group = "MA Overlays", tooltip = "Default: 1D. Choose the timeframe used by the simple averages.")
+sma1LenInput    = input.int(200, "SMA 1 Length (200D)", minval = 1, group = "MA Overlays", inline = "sma1", tooltip = "Default: 200.")
+sma1SrcInput    = input.source(close, "Source", group = "MA Overlays", inline = "sma1", tooltip = "Default: close price.")
+sma1Color       = input.color(#787B86, "Color", group = "MA Overlays", inline = "sma1", tooltip = "Default: #787B86 placeholder.")
+sma2LenInput    = input.int(29, "SMA 2 Length (29D short)", minval = 1, group = "MA Overlays", inline = "sma2", tooltip = "Default: 29. Short leg of the researched daily SMA crossover pair.")
+sma2SrcInput    = input.source(close, "Source", group = "MA Overlays", inline = "sma2")
+sma2Color       = input.color(#FF9800, "Color", group = "MA Overlays", inline = "sma2")
+sma3LenInput    = input.int(160, "SMA 3 Length (160D long)", minval = 1, group = "MA Overlays", inline = "sma3", tooltip = "Default: 160. Long leg of the researched daily SMA crossover pair.")
+sma3SrcInput    = input.source(close, "Source", group = "MA Overlays", inline = "sma3")
+sma3Color       = input.color(#9C27B0, "Color", group = "MA Overlays", inline = "sma3")
+
+showEmaOverlay = maEnableInput and timeframe.in_seconds() <= timeframe.in_seconds(emaAnchorInput)
+showSmaOverlay = maEnableInput and timeframe.in_seconds() <= timeframe.in_seconds(smaAnchorInput)
+
+emaScale = math.max(int(math.round(timeframe.in_seconds(emaAnchorInput) / timeframe.in_seconds())), 1)
+smaScale = math.max(int(math.round(timeframe.in_seconds(smaAnchorInput) / timeframe.in_seconds())), 1)
+
+// Pine Script has NO built-in ta.tema (MT5 ships one; Pine does not). TEMA is composed here
+// from three chained EMAs: TEMA = 3*EMA1 - 3*EMA2 + EMA3. Global scope, so it can be called
+// both inside request.security (native stepped) and on chart source (Smooth).
+f_tema(src, len) =>
+    e1 = ta.ema(src, len)
+    e2 = ta.ema(e1, len)
+    e3 = ta.ema(e2, len)
+    3.0 * (e1 - e2) + e3
+
+// Triple Exponential Moving Averages (TEMA)
+ema1Stepped = request.security(syminfo.tickerid, emaAnchorInput, f_tema(ema1SrcInput, ema1LenInput), lookahead = barmerge.lookahead_off)
+ema2Stepped = request.security(syminfo.tickerid, emaAnchorInput, f_tema(ema2SrcInput, ema2LenInput), lookahead = barmerge.lookahead_off)
+ema3Stepped = request.security(syminfo.tickerid, emaAnchorInput, f_tema(ema3SrcInput, ema3LenInput), lookahead = barmerge.lookahead_off)
+ema4Stepped = request.security(syminfo.tickerid, emaAnchorInput, f_tema(ema4SrcInput, ema4LenInput), lookahead = barmerge.lookahead_off)
+
+sma1Stepped  = request.security(syminfo.tickerid, smaAnchorInput, ta.sma(sma1SrcInput, sma1LenInput), lookahead = barmerge.lookahead_off)
+sma2Stepped  = request.security(syminfo.tickerid, smaAnchorInput, ta.sma(sma2SrcInput, sma2LenInput), lookahead = barmerge.lookahead_off)
+sma3Stepped  = request.security(syminfo.tickerid, smaAnchorInput, ta.sma(sma3SrcInput, sma3LenInput), lookahead = barmerge.lookahead_off)
+
+smoothLenCap = 5000
+ema1Smooth = f_tema(ema1SrcInput, math.min(math.max(ema1LenInput * emaScale, 1), smoothLenCap))
+ema2Smooth = f_tema(ema2SrcInput, math.min(math.max(ema2LenInput * emaScale, 1), smoothLenCap))
+ema3Smooth = f_tema(ema3SrcInput, math.min(math.max(ema3LenInput * emaScale, 1), smoothLenCap))
+ema4Smooth = f_tema(ema4SrcInput, math.min(math.max(ema4LenInput * emaScale, 1), smoothLenCap))
+sma1Smooth  = ta.sma(sma1SrcInput,  math.min(math.max(sma1LenInput  * smaScale, 1), smoothLenCap))
+sma2Smooth  = ta.sma(sma2SrcInput,  math.min(math.max(sma2LenInput  * smaScale, 1), smoothLenCap))
+sma3Smooth  = ta.sma(sma3SrcInput,  math.min(math.max(sma3LenInput  * smaScale, 1), smoothLenCap))
+
+ema1Value = maSmoothInput ? ema1Smooth : ema1Stepped
+ema2Value = maSmoothInput ? ema2Smooth : ema2Stepped
+ema3Value = maSmoothInput ? ema3Smooth : ema3Stepped
+ema4Value = maSmoothInput ? ema4Smooth : ema4Stepped
+sma1Value  = maSmoothInput ? sma1Smooth  : sma1Stepped
+sma2Value  = maSmoothInput ? sma2Smooth  : sma2Stepped
+sma3Value  = maSmoothInput ? sma3Smooth  : sma3Stepped
+
+plot(showEmaOverlay ? ema1Value : na, title = "TEMA 1 (10)", color = ema1Color, linewidth = 1)
+plot(showEmaOverlay ? ema2Value : na, title = "TEMA 2 (20)", color = ema2Color, linewidth = 1)
+plot(showEmaOverlay ? ema3Value : na, title = "TEMA 3 (40)", color = ema3Color, linewidth = 1)
+plot(showEmaOverlay ? ema4Value : na, title = "TEMA 4 (60)", color = ema4Color, linewidth = 1)
+plot(showSmaOverlay ? sma1Value  : na, title = "SMA 1 (200D)", color = sma1Color, linewidth = 2)
+plot(showSmaOverlay ? sma2Value  : na, title = "SMA 2 (29D)", color = sma2Color, linewidth = 2)
+plot(showSmaOverlay ? sma3Value  : na, title = "SMA 3 (160D)", color = sma3Color, linewidth = 2)
+
+
+// =============================================================================================
+// SECTION: WILLIAMS %R SITUATIONAL AWARENESS DASHBOARD
+// =============================================================================================
+// WPR = (HH(N) - close) / (HH(N) - LL(N)) * -100 : the close's position inside the N-period
+// high-low range. 0 = range top, -100 = range bottom, -50 = equilibrium divider.
+// Owner semantics (ratified): above -50 = premium half, below -50 = discount half;
+// -20 and -80 are DEPTH lines inside each half, not signal thresholds. Display-only.
+wprEnableInput = input.bool(true, "Enable WPR Dashboard", group = "Spatial Awareness (WPR)", tooltip = "Corner dashboard: where the close sits inside the 20/40/60 ranges. No second indicator slot, no price-scale distortion.")
+wprAnchorInput = input.timeframe("1D", "Range anchor timeframe", group = "Spatial Awareness (WPR)", tooltip = "Default: 1D. The timeframe whose ranges are measured, regardless of the chart you view. Daily-anchored awareness per system doctrine.")
+wprPosInput = input.string("Middle right", "Dashboard position", options = ["Top right", "Middle right", "Middle left", "Top left", "Bottom left", "Middle center"], group = "Spatial Awareness (WPR)", tooltip = "Default: Middle right. Keeps it out of the way of price action and CORE elements.")
+
+// lookahead_on is deliberate: the dashboard reads ONLY the last bar, so it shows the live
+// developing anchor-candle value (what you would see standing on the Daily chart).
+// No historical series is plotted, so there is nothing to repaint.
+wpr20 = request.security(syminfo.tickerid, wprAnchorInput, ta.wpr(20), lookahead = barmerge.lookahead_on)
+wpr40 = request.security(syminfo.tickerid, wprAnchorInput, ta.wpr(40), lookahead = barmerge.lookahead_on)
+wpr60 = request.security(syminfo.tickerid, wprAnchorInput, ta.wpr(60), lookahead = barmerge.lookahead_on)
+
+f_wprZone(float val) =>
+    val > -20 ? "Deep Prem" : val > -50 ? "Premium" : val >= -80 ? "Discount" : "Deep Disc"
+f_wprColor(float val) =>
+    val > -20 ? color.red : val > -50 ? color.orange : val >= -80 ? color.green : color.teal
+
+wprPos = wprPosInput == "Top right" ? position.top_right : wprPosInput == "Middle right" ? position.middle_right : wprPosInput == "Top left" ? position.top_left : wprPosInput == "Bottom left" ? position.bottom_left : wprPosInput == "Middle center" ? position.middle_center : position.middle_left
+
+// Compact 2-column table, small text, high contrast background
+var table wprTable = table.new(position.middle_right, 2, 4, bgcolor=color.new(#000000, 10), border_width=1, border_color=color.gray)
+if barstate.islast and wprEnableInput
+    table.set_position(wprTable, wprPos)
+    table.cell(wprTable, 0, 0, "WPR", text_color=color.white, bgcolor=color.new(#333333, 0), text_size=size.small)
+    table.cell(wprTable, 1, 0, "Value | Zone", text_color=color.white, bgcolor=color.new(#333333, 0), text_size=size.small)
+    table.cell(wprTable, 0, 1, "20D", text_color=color.white, text_size=size.small)
+    table.cell(wprTable, 1, 1, str.tostring(wpr20, "#.0") + " | " + f_wprZone(wpr20), text_color=f_wprColor(wpr20), text_size=size.small)
+    table.cell(wprTable, 0, 2, "40D", text_color=color.white, text_size=size.small)
+    table.cell(wprTable, 1, 2, str.tostring(wpr40, "#.0") + " | " + f_wprZone(wpr40), text_color=f_wprColor(wpr40), text_size=size.small)
+    table.cell(wprTable, 0, 3, "60D", text_color=color.white, text_size=size.small)
+    table.cell(wprTable, 1, 3, str.tostring(wpr60, "#.0") + " | " + f_wprZone(wpr60), text_color=f_wprColor(wpr60), text_size=size.small)
+
+// =============================================================================================
+// SECTION 9C -- CANDLESTICK PATTERNS: SHARED SIZING CORE
+// =============================================================================================
+patternBodyAvgLenInput = input.int(14, "Body-size average length", minval = 1, group = "Candlestick Patterns", tooltip = "Default: 14. Set the number of native candles in the body-size average; longer values adapt more slowly.")
+dojiBodyPctInput       = input.float(5.0, "Doji body % of range", minval = 0.5, step = 0.5, group = "Candlestick Patterns", tooltip = "Default: 5.0. Raise the largest body size allowed for a small-body doji, as a percentage of its whole candle.")
+shadowEqualsInput      = input.float(100.0, "Doji shadow balance tolerance %", minval = 1.0, step = 5.0, group = "Candlestick Patterns", tooltip = "Default: 100.0. Raise the allowed difference between the two doji wicks; lower values require closer balance.")
+shadowPercentInput     = input.float(5.0, "Shadow existence % of body", minval = 0.5, step = 0.5, group = "Candlestick Patterns", tooltip = "Default: 5.0. Set the smallest wick counted as present, as a percentage of the candle body.")
+spinningPctInput       = input.float(34.0, "Spinning top shadow % of range", minval = 1.0, step = 1.0, group = "Candlestick Patterns", tooltip = "Default: 34.0. Set the minimum size of each spinning-top wick, as a percentage of the whole candle.")
+hammerFactorInput      = input.float(2.0, "Hammer shadow multiple of body", minval = 1.0, step = 0.5, group = "Candlestick Patterns", tooltip = "Default: 2.0. Set how many times longer the main hammer wick must be than its body.")
+
+f_candleCore() =>
+    bodyHi   = math.max(close, open)
+    bodyLo   = math.min(close, open)
+    body     = bodyHi - bodyLo
+    bodyAvg  = ta.ema(body, patternBodyAvgLenInput)
+    smallBody = body < bodyAvg
+    longBody  = body > bodyAvg
+    upShadow  = high - bodyHi
+    dnShadow  = bodyLo - low
+    hasUpShadow = upShadow > shadowPercentInput / 100.0 * body
+    hasDnShadow = dnShadow > shadowPercentInput / 100.0 * body
+    whiteBody = open < close
+    blackBody = open > close
+    rng       = high - low
+    bodyMiddle = body / 2.0 + bodyLo
+    shadowBalanced = upShadow == dnShadow or (dnShadow != 0 and upShadow != 0 and (math.abs(upShadow - dnShadow) / dnShadow * 100.0) < shadowEqualsInput and (math.abs(dnShadow - upShadow) / upShadow * 100.0) < shadowEqualsInput)
+    isDojiBody = rng > 0 and body <= rng * dojiBodyPctInput / 100.0
+    isDoji     = isDojiBody and shadowBalanced
+    spinningShape = rng > 0 and dnShadow >= rng * spinningPctInput / 100.0 and upShadow >= rng * spinningPctInput / 100.0 and not isDojiBody
+    hammerShape = smallBody and body > 0 and bodyLo > hl2 and dnShadow >= hammerFactorInput * body and not hasUpShadow
+    [smallBody, longBody, whiteBody, blackBody, isDojiBody, isDoji, spinningShape, hammerShape, hasUpShadow, hasDnShadow, bodyHi, bodyLo, bodyMiddle, bodyAvg]
+
+// =============================================================================================
+// SECTION 9D -- CANDLESTICK PATTERNS: DETECTORS & TF1/TF2 PULLS
+// =============================================================================================
+renderTf1PatternsInput = input.bool(true, "Render Patterns on TF1", group = "Candlestick Patterns", tooltip = "Default: on. Show native candlestick labels for this layer; raw shape calculations continue.")
+renderTf2PatternsInput = input.bool(true, "Render Patterns on TF2", group = "Candlestick Patterns", tooltip = "Default: on. Show native candlestick labels for this layer; raw shape calculations continue.")
+patEngulfingInput = input.bool(true, "Engulfing", group = "Candlestick Patterns", inline = "pat1", tooltip = "Default: on. Show or hide this candlestick family; setup eligibility stays independent.")
+patTweezerInput   = input.bool(true, "Tweezer", group = "Candlestick Patterns", inline = "pat1", tooltip = "Default: on. Show or hide this candlestick family; setup eligibility stays independent.")
+patSpinningInput  = input.bool(true, "Spinning Top", group = "Candlestick Patterns", inline = "pat2", tooltip = "Default: on. Show or hide this candlestick family; setup eligibility stays independent.")
+patMorningInput   = input.bool(true, "Morning Star", group = "Candlestick Patterns", inline = "pat2", tooltip = "Default: on. Show or hide this candlestick family; setup eligibility stays independent.")
+patEveningInput   = input.bool(true, "Evening Star", group = "Candlestick Patterns", inline = "pat3", tooltip = "Default: on. Show or hide this candlestick family; setup eligibility stays independent.")
+patHammerInput    = input.bool(true, "Hammer / Hanging Man", group = "Candlestick Patterns", inline = "pat3", tooltip = "Default: on. Show or hide this candlestick family; setup eligibility stays independent.")
+tweezerToleranceInput = input.float(5.0, "Tweezer tolerance % of body EMA", minval = 0, step = 0.5, group = "Candlestick Patterns", tooltip = "Default: 5.0. Increase the allowed difference between paired highs or lows, measured against the average candle body.")
+
+f_patterns() =>
+    [smallBody, longBody, whiteBody, blackBody, isDojiBody, isDoji, spinningShape, hammerShape, hasUpShadow, hasDnShadow, bodyHi, bodyLo, bodyMiddle, bodyAvg] = f_candleCore()
+    bool p1 = whiteBody and longBody and blackBody[1] and smallBody[1] and close >= open[1] and open <= close[1] and (close > open[1] or open < close[1])
+    bool p2 = blackBody and longBody and whiteBody[1] and smallBody[1] and close <= open[1] and open >= close[1] and (close < open[1] or open > close[1])
+    bool tweezerGuard = not isDojiBody or (hasUpShadow and hasDnShadow)
+    bool p3 = tweezerGuard and math.abs(high-high[1]) <= bodyAvg*tweezerToleranceInput/100.0 and whiteBody[1] and blackBody and longBody[1]  and high >= high[1] and close < high[1]
+    bool p4 = tweezerGuard and math.abs(low-low[1]) <= bodyAvg*tweezerToleranceInput/100.0 and blackBody[1] and whiteBody and longBody[1]  and low <= low[1] and close > low[1]
+    bool p5 = spinningShape
+    bool p6 = longBody[2] and smallBody[1] and longBody and blackBody[2] and bodyHi[1] < bodyLo[2] and whiteBody and bodyHi >= bodyMiddle[2] and bodyHi < bodyHi[2] and bodyHi[1] < bodyLo
+    bool p7 = longBody[2] and isDojiBody[1] and longBody and blackBody[2] and bodyHi[1] < bodyLo[2] and whiteBody and bodyHi >= bodyMiddle[2] and bodyHi < bodyHi[2] and bodyHi[1] < bodyLo
+    bool p8 = longBody[2] and smallBody[1] and longBody and whiteBody[2] and bodyLo[1] > bodyHi[2] and blackBody and bodyLo <= bodyMiddle[2] and bodyLo > bodyLo[2] and bodyLo[1] > bodyHi
+    bool p9 = longBody[2] and isDojiBody[1] and longBody and whiteBody[2] and bodyLo[1] > bodyHi[2] and blackBody and bodyLo <= bodyMiddle[2] and bodyLo > bodyLo[2] and bodyLo[1] > bodyHi
+    bool p10 = hammerShape
+    bool p11 = hammerShape
+    int flags = (p1 ? 1 : 0) + (p2 ? 2 : 0) + (p3 ? 4 : 0) + (p4 ? 8 : 0) + (p5 ? 16 : 0) + (p6 ? 32 : 0) + (p7 ? 64 : 0) + (p8 ? 128 : 0) + (p9 ? 256 : 0) + (p10 ? 512 : 0) + (p11 ? 1024 : 0)
+    flags
+
+tf1PatFlags = request.security(syminfo.tickerid, tf1Input, f_patterns()[1], lookahead = barmerge.lookahead_on)
+tf2PatFlags = request.security(syminfo.tickerid, tf2Input, f_patterns()[1], lookahead = barmerge.lookahead_on)
+
+f_bit(int flags, int mask) =>
+    (flags % (2 * mask)) >= mask
+
+bool tf1_BullEng    = f_bit(tf1PatFlags, 1)    and patEngulfingInput
+bool tf1_BearEng    = f_bit(tf1PatFlags, 2)    and patEngulfingInput
+bool tf1_TweezerTop = f_bit(tf1PatFlags, 4)    and patTweezerInput
+bool tf1_TweezerBot = f_bit(tf1PatFlags, 8)    and patTweezerInput
+bool tf1_Spinning   = f_bit(tf1PatFlags, 16)   and patSpinningInput
+bool tf1_MorStar    = f_bit(tf1PatFlags, 32)   and patMorningInput
+bool tf1_MorDoji    = f_bit(tf1PatFlags, 64)   and patMorningInput
+bool tf1_EveStar    = f_bit(tf1PatFlags, 128)  and patEveningInput
+bool tf1_EveDoji    = f_bit(tf1PatFlags, 256)  and patEveningInput
+bool tf1_Hammer     = f_bit(tf1PatFlags, 512)  and patHammerInput
+bool tf1_HangMan    = f_bit(tf1PatFlags, 1024) and patHammerInput
+
+bool tf2_BullEng    = f_bit(tf2PatFlags, 1)    and patEngulfingInput
+bool tf2_BearEng    = f_bit(tf2PatFlags, 2)    and patEngulfingInput
+bool tf2_TweezerTop = f_bit(tf2PatFlags, 4)    and patTweezerInput
+bool tf2_TweezerBot = f_bit(tf2PatFlags, 8)    and patTweezerInput
+bool tf2_Spinning   = f_bit(tf2PatFlags, 16)   and patSpinningInput
+bool tf2_MorStar    = f_bit(tf2PatFlags, 32)   and patMorningInput
+bool tf2_MorDoji    = f_bit(tf2PatFlags, 64)   and patMorningInput
+bool tf2_EveStar    = f_bit(tf2PatFlags, 128)  and patEveningInput
+bool tf2_EveDoji    = f_bit(tf2PatFlags, 256)  and patEveningInput
+bool tf2_Hammer     = f_bit(tf2PatFlags, 512)  and patHammerInput
+bool tf2_HangMan    = f_bit(tf2PatFlags, 1024) and patHammerInput
+
+// =============================================================================================
+// SECTION 9E -- CANDLESTICK PATTERNS: TREND CONTEXT
+// =============================================================================================
+tf1TrendRuleInput    = input.string("Price vs Fast SMA", "TF1 Trend Context Rule", options=["Price vs Fast SMA", "Stacked Fast/Slow SMA", "No detection"], group = "Candlestick Patterns", tooltip = "Default: Price vs Fast SMA. Choose the TF1-local simple-average context used only by candlestick labels; setup eligibility stays independent.")
+tf1TrendFastLenInput = input.int(5, "Fast SMA length", minval = 1, group = "Candlestick Patterns", inline = "tf1TrendLens", tooltip = "Default: 5. Set the faster native simple-average length used by TF1 candlestick context.")
+tf1TrendSlowLenInput = input.int(20, "Slow SMA length", minval = 1, group = "Candlestick Patterns", inline = "tf1TrendLens", tooltip = "Default: 20. Set the slower native simple-average length used by stacked TF1 candlestick context.")
+
+tf1SmaFast = request.security(syminfo.tickerid, tf1Input, ta.sma(close, tf1TrendFastLenInput)[1], lookahead = barmerge.lookahead_on)
+tf1SmaSlow = request.security(syminfo.tickerid, tf1Input, ta.sma(close, tf1TrendSlowLenInput)[1], lookahead = barmerge.lookahead_on)
+tf1Close   = request.security(syminfo.tickerid, tf1Input, close[1], lookahead = barmerge.lookahead_on)
+
+bool tf1_LocalUpTrend = false
+bool tf1_LocalDownTrend = false
+
+if tf1TrendRuleInput == "Price vs Fast SMA"
+    tf1_LocalUpTrend := tf1Close > tf1SmaFast
+    tf1_LocalDownTrend := tf1Close < tf1SmaFast
+else if tf1TrendRuleInput == "Stacked Fast/Slow SMA"
+    tf1_LocalUpTrend := tf1Close > tf1SmaFast and tf1SmaFast > tf1SmaSlow
+    tf1_LocalDownTrend := tf1Close < tf1SmaFast and tf1SmaFast < tf1SmaSlow
+else 
+    tf1_LocalUpTrend := true
+    tf1_LocalDownTrend := true
+
+bool tf2_LocalUpTrend = true
+bool tf2_LocalDownTrend = true
+
+bool final_tf1_BullEng    = tf1_BullEng    and tf1_LocalDownTrend 
+bool final_tf1_BearEng    = tf1_BearEng    and tf1_LocalUpTrend   
+bool final_tf1_TweezerTop = tf1_TweezerTop
+bool final_tf1_TweezerBot = tf1_TweezerBot
+bool final_tf1_Spinning   = tf1_Spinning   and (tf1_LocalUpTrend or tf1_LocalDownTrend) 
+bool final_tf1_MorStar    = tf1_MorStar    and tf1_LocalDownTrend
+bool final_tf1_MorDoji    = tf1_MorDoji    and tf1_LocalDownTrend
+bool final_tf1_EveStar    = tf1_EveStar    and tf1_LocalUpTrend
+bool final_tf1_EveDoji    = tf1_EveDoji    and tf1_LocalUpTrend
+bool final_tf1_Hammer     = tf1_Hammer     and tf1_LocalDownTrend
+bool final_tf1_HangMan    = tf1_HangMan    and tf1_LocalUpTrend
+
+bool final_tf2_BullEng    = tf2_BullEng    and tf2_LocalDownTrend
+bool final_tf2_BearEng    = tf2_BearEng    and tf2_LocalUpTrend
+bool final_tf2_TweezerTop = tf2_TweezerTop
+bool final_tf2_TweezerBot = tf2_TweezerBot
+bool final_tf2_Spinning   = tf2_Spinning   and (tf2_LocalUpTrend or tf2_LocalDownTrend) 
+bool final_tf2_MorStar    = tf2_MorStar    and tf2_LocalDownTrend
+bool final_tf2_MorDoji    = tf2_MorDoji    and tf2_LocalDownTrend
+bool final_tf2_EveStar    = tf2_EveStar    and tf2_LocalUpTrend
+bool final_tf2_EveDoji    = tf2_EveDoji    and tf2_LocalUpTrend
+bool final_tf2_Hammer     = tf2_Hammer     and tf2_LocalDownTrend
+bool final_tf2_HangMan    = tf2_HangMan    and tf2_LocalUpTrend
+
+// =============================================================================================
+// SECTION 9F -- CANDLESTICK PATTERNS: RENDERING, STAMPS & BOUNDED LIFETIME
+// =============================================================================================
+patternLabelKeepInput = input.int(25, "Retained pattern labels (per layer)", minval = 1, maxval = 250, group = "Candlestick Patterns", tooltip = "Default: 25. Keep this many pattern labels per timeframe layer; older labels are deleted.")
+patternLabelSizeInput = input.string("Tiny", "Pattern label size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = "Candlestick Patterns", tooltip = "Default: Tiny. Choose the size of this display text.")
+patternBullColor      = input.color(#26a69a, "Bullish pattern color", group = "Candlestick Patterns", inline = "patColors", tooltip = "Default: #26a69a placeholder.")
+patternBearColor      = input.color(#ef5350, "Bearish pattern color", group = "Candlestick Patterns", inline = "patColors", tooltip = "Default: #ef5350 placeholder.")
+patternNeutralColor   = input.color(#787B86, "Neutral pattern color", group = "Candlestick Patterns", inline = "patColors", tooltip = "Default: #787B86 placeholder.")
+
+var patternLabelSize = switch patternLabelSizeInput
+    "Tiny"   => size.tiny
+    "Small"  => size.small
+    "Normal" => size.normal
+    "Large"  => size.large
+    "Huge"   => size.huge
+
+type PatternMark
+    int    t
+    float  y
+    string code
+    string dir
+    label  id
+
+var array<PatternMark> patMarksTf1 = array.new<PatternMark>()
+var array<PatternMark> patMarksTf2 = array.new<PatternMark>()
+
+f_pushPatMark(array<PatternMark> arr, int t, float y, string code, string dir) =>
+    array.push(arr, PatternMark.new(t = t, y = y, code = code, dir = dir, id = na))
+    while array.size(arr) > patternLabelKeepInput
+        oldMark = array.shift(arr)
+        if not na(oldMark.id)
+            label.delete(oldMark.id)
+    true
+
+[tf2CandleHigh, tf2CandleLow] = request.security(syminfo.tickerid, tf2Input, [high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+if newTf1Bar and not na(tf1ClosedT)
+    bullOff1 = tf1L * 0.0015
+    bearOff1 = tf1H * 0.0015
+    if final_tf1_BullEng
+        f_pushPatMark(patMarksTf1, tf1ClosedT, tf1L - bullOff1, "ENG", "bull")
+    if final_tf1_BearEng
+        f_pushPatMark(patMarksTf1, tf1ClosedT, tf1H + bearOff1, "ENG", "bear")
+    if final_tf1_TweezerBot
+        f_pushPatMark(patMarksTf1, tf1ClosedT, tf1L - bullOff1, "TWZ", "bull")
+    if final_tf1_TweezerTop
+        f_pushPatMark(patMarksTf1, tf1ClosedT, tf1H + bearOff1, "TWZ", "bear")
+    if final_tf1_MorStar
+        f_pushPatMark(patMarksTf1, tf1ClosedT, tf1L - bullOff1, "MST", "bull")
+    if final_tf1_MorDoji
+        f_pushPatMark(patMarksTf1, tf1ClosedT, tf1L - bullOff1, "MDS", "bull")
+    if final_tf1_EveStar
+        f_pushPatMark(patMarksTf1, tf1ClosedT, tf1H + bearOff1, "EST", "bear")
+    if final_tf1_EveDoji
+        f_pushPatMark(patMarksTf1, tf1ClosedT, tf1H + bearOff1, "EDS", "bear")
+    if final_tf1_Hammer
+        f_pushPatMark(patMarksTf1, tf1ClosedT, tf1L - bullOff1, "HAM", "bull")
+    if final_tf1_HangMan
+        f_pushPatMark(patMarksTf1, tf1ClosedT, tf1H + bearOff1, "HGM", "bear")
+    if final_tf1_Spinning
+        f_pushPatMark(patMarksTf1, tf1ClosedT, tf1L - bullOff1, "SPN", "neutral")
+
+if newTf2Bar and not na(tf2ClosedT)
+    bullOff2 = tf2CandleLow * 0.0015
+    bearOff2 = tf2CandleHigh * 0.0015
+    if final_tf2_BullEng
+        f_pushPatMark(patMarksTf2, tf2ClosedT, tf2CandleLow - bullOff2, "ENG", "bull")
+    if final_tf2_BearEng
+        f_pushPatMark(patMarksTf2, tf2ClosedT, tf2CandleHigh + bearOff2, "ENG", "bear")
+    if final_tf2_TweezerBot
+        f_pushPatMark(patMarksTf2, tf2ClosedT, tf2CandleLow - bullOff2, "TWZ", "bull")
+    if final_tf2_TweezerTop
+        f_pushPatMark(patMarksTf2, tf2ClosedT, tf2CandleHigh + bearOff2, "TWZ", "bear")
+    if final_tf2_MorStar
+        f_pushPatMark(patMarksTf2, tf2ClosedT, tf2CandleLow - bullOff2, "MST", "bull")
+    if final_tf2_MorDoji
+        f_pushPatMark(patMarksTf2, tf2ClosedT, tf2CandleLow - bullOff2, "MDS", "bull")
+    if final_tf2_EveStar
+        f_pushPatMark(patMarksTf2, tf2ClosedT, tf2CandleHigh + bearOff2, "EST", "bear")
+    if final_tf2_EveDoji
+        f_pushPatMark(patMarksTf2, tf2ClosedT, tf2CandleHigh + bearOff2, "EDS", "bear")
+    if final_tf2_Hammer
+        f_pushPatMark(patMarksTf2, tf2ClosedT, tf2CandleLow - bullOff2, "HAM", "bull")
+    if final_tf2_HangMan
+        f_pushPatMark(patMarksTf2, tf2ClosedT, tf2CandleHigh + bearOff2, "HGM", "bear")
+    if final_tf2_Spinning
+        f_pushPatMark(patMarksTf2, tf2ClosedT, tf2CandleLow - bullOff2, "SPN", "neutral")
+
+drawTf1Pats = showTf1 and renderTf1PatternsInput
+drawTf2Pats = showTf2 and renderTf2PatternsInput
+
+f_patColor(dir) =>
+    dir == "bull" ? patternBullColor : dir == "bear" ? patternBearColor : patternNeutralColor
+
+f_patStyle(dir) =>
+    dir == "bear" ? label.style_label_down : label.style_label_up
+
+if drawTf1Pats
+    for m in patMarksTf1
+        if na(m.id)
+            m.id := label.new(x = m.t, y = m.y, text = m.code, xloc = xloc.bar_time, yloc = yloc.price, style = f_patStyle(m.dir), color = f_patColor(m.dir), textcolor = color.white, size = patternLabelSize)
+        else
+            label.set_color(m.id, f_patColor(m.dir))
+else
+    for m in patMarksTf1
+        if not na(m.id)
+            label.delete(m.id)
+            m.id := na
+
+if drawTf2Pats
+    for m in patMarksTf2
+        if na(m.id)
+            m.id := label.new(x = m.t, y = m.y, text = m.code, xloc = xloc.bar_time, yloc = yloc.price, style = f_patStyle(m.dir), color = f_patColor(m.dir), textcolor = color.white, size = patternLabelSize)
+        else
+            label.set_color(m.id, f_patColor(m.dir))
+else
+    for m in patMarksTf2
+        if not na(m.id)
+            label.delete(m.id)
+            m.id := na
+
+// =============================================================================================
+// SECTION 23 -- INDEPENDENT HTF CANDLE PANEL (Fixed Uniform Spacing via Bar Index)
+// =============================================================================================
+type V3PanelCandle
+    float o
+    float h
+    float l
+    float c
+    int t
+    int boundary
+    int bIdx
+
+type V3PanelGroup
+    array<V3PanelCandle> history
+    V3PanelCandle live = na
+    string nativeTf = ""
+    int desired = 1
+    string name = ""
+
+var array<V3PanelGroup> v3PanelGroups = array.new<V3PanelGroup>()
+if barstate.isfirst
+    for slot = 0 to 5
+        array.push(v3PanelGroups, V3PanelGroup.new(history = array.new<V3PanelCandle>()))
+v3PanelTfs = array.from(v3Panel1Tf, v3Panel2Tf, v3Panel3Tf, v3Panel4Tf, v3Panel5Tf, v3Panel6Tf)
+v3PanelOns = array.from(v3Panel1On, v3Panel2On, v3Panel3On, v3Panel4On, v3Panel5On, v3Panel6On)
+v3PanelCounts = array.from(v3Panel1Count, v3Panel2Count, v3Panel3Count, v3Panel4Count, v3Panel5Count, v3Panel6Count)
+v3PanelNames = array.from(v3Panel1Label, v3Panel2Label, v3Panel3Label, v3Panel4Label, v3Panel5Label, v3Panel6Label)
+var array<string> v3SeenPanel = array.new<string>()
+array.clear(v3SeenPanel)
+for slot = 0 to 5
+    group = array.get(v3PanelGroups, slot)
+    nativeTf = array.get(v3PanelTfs, slot)
+    group.nativeTf := nativeTf
+    group.desired := array.get(v3PanelCounts, slot)
+    group.name := array.get(v3PanelNames, slot)
+    eligible = v3PanelInput and array.get(v3PanelOns, slot) and f_v3TfRank(nativeTf) > f_v3TfRank(timeframe.period) and not array.includes(v3SeenPanel, f_v3TfKey(nativeTf)) and (timeframe.in_seconds(nativeTf) / timeframe.in_seconds()) >= 2
+    if eligible
+        array.push(v3SeenPanel, f_v3TfKey(nativeTf))
+        [o, h, l, c, t, boundary, bIdx] = request.security(syminfo.tickerid, nativeTf, [open[1], high[1], low[1], close[1], time[1], time_close[1], bar_index[1]], lookahead = barmerge.lookahead_on)
+        [liveO, liveH, liveL, liveC, liveT, liveEnd, liveBIdx] = request.security(syminfo.tickerid, nativeTf, [open, high, low, close, time, time_close, bar_index], lookahead = barmerge.lookahead_on)
+        lastT = array.size(group.history) > 0 ? array.get(group.history, array.size(group.history)-1).t : na
+        if not na(t) and (na(lastT) or t != lastT)
+            array.push(group.history, V3PanelCandle.new(o, h, l, c, t, boundary, bIdx))
+            while array.size(group.history) > group.desired
+                array.shift(group.history)
+        currentNativeTime = time(nativeTf)
+        isLive = not na(liveT) and liveT == currentNativeTime
+        group.live := isLive ? V3PanelCandle.new(liveO, liveH, liveL, liveC, liveT, liveEnd, liveBIdx) : na
+    else
+        group.live := na
+
+f_v3PanelBox(int left, float upper, int right, float lower, color fill, color border) =>
+    if f_v3Room(0, 1, 0)
+        handle = box.new(left, upper, right, lower, xloc = xloc.bar_index, bgcolor = fill, border_color = border)
+        array.push(v3PanelBoxes, handle)
+    true
+f_v3PanelLine(int start, float y1, int finish, float y2, color ink, string styleValue, int widthValue) =>
+    if f_v3Room(1, 0, 0)
+        handle = line.new(start, y1, finish, y2, xloc = xloc.bar_index, color = ink, style = styleValue, width = widthValue)
+        array.push(v3PanelLines, handle)
+    true
+f_v3PanelLabel(int x, float y, string textValue) =>
+    if f_v3Room(0, 0, 1)
+        handle = label.new(x, y, textValue, xloc = xloc.bar_index, style = label.style_none, textcolor = v3PanelLabelColorInput, size = f_v3Size(v3PanelLabelSizeInput))
+        array.push(v3PanelLabels, handle)
+    true
+f_v3Countdown(int boundary) =>
+    secondsLeft = int(math.max(boundary - timenow, 0) / 1000)
+    daysLeft = int(secondsLeft / 86400)
+    hoursLeft = int((secondsLeft % 86400) / 3600)
+    minutesLeft = int((secondsLeft % 3600) / 60)
+    daysLeft > 0 ? str.tostring(daysLeft) + "d " + str.tostring(hoursLeft) + "h" : str.tostring(hoursLeft) + "h " + str.tostring(minutesLeft) + "m " + str.tostring(secondsLeft % 60) + "s"
+
+// Pine has no nested array types (array<array<T>> does not exist). One-field wrapper UDT
+// is the standard idiom for "array of candle sets" (IL-21 / T-11).
+type V3PanelSet
+    array<V3PanelCandle> candles
+
+// RE10020 budget helper. GLOBAL scope (IL-19): Pine forbids function definitions in local blocks.
+// Returns the total chart bars the panel will occupy to the right of the current bar.
+f_v3PanelCost(array<V3PanelSet> sets, array<int> widths, int space, int groupSpace, int padding) =>
+    int cost = padding
+    if array.size(sets) > 0
+        for i = 0 to array.size(sets)-1
+            cost += array.size(array.get(sets, i).candles) * (array.get(widths, i) + space) + groupSpace
+    cost
+
+var table v3StatusTable = table.new(position.top_right, 1, 1)
+if barstate.islast
+    int displayedGroups = 0
+    int skippedSlots = 0
+    int truncatedGroups = 0
+    float rowTop = na
+    float rowBottom = na
+    array<V3PanelGroup> chosen = array.new<V3PanelGroup>()
+    array.clear(v3SeenPanel)
+    if v3PanelInput
+        for slot = 0 to 5
+            group = array.get(v3PanelGroups, slot)
+            enabled = array.get(v3PanelOns, slot)
+            higher = f_v3TfRank(group.nativeTf) > f_v3TfRank(timeframe.period)
+            skippedSlots += enabled and not higher ? 1 : 0
+            truncatedGroups += enabled and higher and displayedGroups >= v3PanelLimitInput ? 1 : 0
+            if enabled and higher and displayedGroups < v3PanelLimitInput and not array.includes(v3SeenPanel, f_v3TfKey(group.nativeTf))
+                array.push(v3SeenPanel, f_v3TfKey(group.nativeTf))
+                array.push(chosen, group)
+                displayedGroups += 1
+                for candle in group.history
+                    rowTop := na(rowTop) ? candle.h : math.max(rowTop, candle.h)
+                    rowBottom := na(rowBottom) ? candle.l : math.min(rowBottom, candle.l)
+                if not na(group.live)
+                    rowTop := na(rowTop) ? group.live.h : math.max(rowTop, group.live.h)
+                    rowBottom := na(rowBottom) ? group.live.l : math.min(rowBottom, group.live.l)
+    labelOffset = math.max(nz(rowTop-rowBottom, 0)*0.025, syminfo.mintick*10)
+
+    // Pass 1: build candle sets and native-proportional widths BEFORE any drawing.
+    array<V3PanelSet> sets = array.new<V3PanelSet>()
+    array<int> widths = array.new<int>()
+    for group in chosen
+        cds = array.copy(group.history)
+        if not na(group.live)
+            if array.size(cds) == 0
+                array.push(cds, group.live)
+            else if array.get(cds, array.size(cds)-1).t != group.live.t
+                array.push(cds, group.live)
+        while array.size(cds) > group.desired
+            array.shift(cds)
+        int nativeRatio = math.max(1, int(math.round(timeframe.in_seconds(group.nativeTf) / math.max(nz(timeframe.in_seconds(), 1), 1))))
+        // Use math.round instead of int() to prevent 1.6 from truncating down to 1 (which caused the H2 half-bar look).
+        int w = v3PanelWidthModeInput == "Native proportional" ? math.max(1, int(math.round(nativeRatio * 0.8))) : math.max(1, math.min(v3PanelWidthInput, nativeRatio))
+        array.push(sets, V3PanelSet.new(candles = cds))
+        array.push(widths, w)
+
+    // RE10020 budget: bar_index objects may not sit further than 500 bars into the future.
+    int futureBudget = 480
+    int totalBars = f_v3PanelCost(sets, widths, v3PanelSpaceInput, v3PanelGroupSpaceInput, v3PanelPaddingInput)
+    if totalBars > futureBudget
+        float k = futureBudget / math.max(totalBars, 1)
+        for i = 0 to array.size(widths)-1
+            array.set(widths, i, math.max(1, int(array.get(widths, i) * k)))
+        totalBars := f_v3PanelCost(sets, widths, v3PanelSpaceInput, v3PanelGroupSpaceInput, v3PanelPaddingInput)
+    int guard = 0
+    while totalBars > futureBudget and guard < 600
+        guard += 1
+        int biggest = -1
+        int biggestSize = 1
+        for i = 0 to array.size(sets)-1
+            if array.size(array.get(sets, i).candles) > biggestSize
+                biggestSize := array.size(array.get(sets, i).candles)
+                biggest := i
+        if biggest < 0
+            break
+        array.shift(array.get(sets, biggest).candles)
+        totalBars := f_v3PanelCost(sets, widths, v3PanelSpaceInput, v3PanelGroupSpaceInput, v3PanelPaddingInput)
+    int omitted = 0
+
+    // Pass 2: draw, with a hard +499-bar future clamp on every object.
+    int cursorX = bar_index + v3PanelPaddingInput
+    int displayedCandles = 0
+    int drawnGaps = 0
+    V3PanelCandle traceCandle = na
+    int traceX = na
+    int groupIndex = 0
+    if array.size(chosen) > 0
+        for gi = 0 to array.size(chosen)-1
+            group = array.get(chosen, gi)
+            candles = array.get(sets, gi).candles
+            int widthEff = array.get(widths, gi)
+            freeCount = math.max(0, math.min(90-displayedCandles, math.min(470-array.size(line.all), 470-array.size(box.all))))
+            while array.size(candles) > freeCount
+                array.shift(candles)
+                omitted += 1
+            groupStart = cursorX
+            float groupHigh = na
+            float groupLow = na
+            int candleIndex = 0
+            array<int> lefts = array.new<int>()
+            for candle in candles
+                int left = cursorX
+                int right = left + widthEff
+                int center = int((left+right)/2)
+                array.push(lefts, left)
+                bullish = candle.c >= candle.o
+                bool inFuture = right <= bar_index + 499
+                if inFuture
+                    if f_v3Room(0, 1, 0)
+                        if math.max(candle.o,candle.c) == math.min(candle.o,candle.c)
+                            f_v3PanelLine(left, candle.c, right, candle.c, bullish ? v3PanelBullBorder : v3PanelBearBorder, line.style_solid, 1)
+                        else
+                            f_v3PanelBox(left, math.max(candle.o,candle.c), right, math.min(candle.o,candle.c), bullish ? v3PanelBullBody : v3PanelBearBody, bullish ? v3PanelBullBorder : v3PanelBearBorder)
+                        f_v3PanelLine(center, candle.l, center, candle.h, bullish ? v3PanelBullWick : v3PanelBearWick, line.style_solid, 1)
+                    else
+                        omitted += 1
+                else
+                    omitted += 1
+                groupHigh := na(groupHigh) ? candle.h : math.max(groupHigh,candle.h)
+                groupLow := na(groupLow) ? candle.l : math.min(groupLow,candle.l)
+                if inFuture and candleIndex == array.size(candles)-1
+                    if groupIndex == 0 or v3PanelTraceAnchorInput == "Last Timeframe"
+                        traceCandle := candle
+                        traceX := center
+                if inFuture and drawnGaps < 18
+                    if v3PanelFvgInput and candleIndex >= 2
+                        older = array.get(candles,candleIndex-2)
+                        gapDirection = candle.l > older.h ? 1 : candle.h < older.l ? -1 : 0
+                        lower = gapDirection == 1 ? older.h : candle.h
+                        upper = gapDirection == 1 ? candle.l : older.l
+                        bool filled = false
+                        if gapDirection != 0 and candleIndex+1 < array.size(candles)
+                            for laterIndex = candleIndex+1 to array.size(candles)-1
+                                later = array.get(candles,laterIndex)
+                                filled := filled or (gapDirection == 1 ? later.l <= lower : later.h >= upper)
+                        if gapDirection != 0 and not filled
+                            gapLeft = array.get(lefts, candleIndex-2)
+                            f_v3PanelBox(gapLeft, upper, right, lower, v3PanelFvgFillInput, v3PanelFvgBorderInput)
+                            drawnGaps += 1
+                    if v3PanelViInput and candleIndex >= 1 and drawnGaps < 18
+                        prior = array.get(candles,candleIndex-1)
+                        overlap = math.min(candle.h,prior.h) >= math.max(candle.l,prior.l)
+                        direction = candle.o > prior.c ? 1 : candle.o < prior.c ? -1 : 0
+                        lower = v3ViWickExtendInput ? math.min(math.min(candle.o,prior.c), math.max(candle.l,prior.l)) : math.min(candle.o,prior.c)
+                        upper = v3ViWickExtendInput ? math.max(math.max(candle.o,prior.c), math.min(candle.h,prior.h)) : math.max(candle.o,prior.c)
+                        bool filled = false
+                        if direction != 0 and candleIndex+1 < array.size(candles)
+                            for laterIndex = candleIndex+1 to array.size(candles)-1
+                                later = array.get(candles,laterIndex)
+                                filled := filled or (direction == 1 ? later.l <= lower : later.h >= upper)
+                        if overlap and direction != 0 and not filled
+                            gapLeft = array.get(lefts, candleIndex-1)
+                            f_v3PanelBox(gapLeft, upper, right, lower, v3PanelViFillInput, v3PanelViBorderInput)
+                            drawnGaps += 1
+                cursorX += widthEff + v3PanelSpaceInput
+                displayedCandles += 1
+                candleIndex += 1
+            if array.size(candles) > 0
+                textValue = v3PanelLabelInput ? (group.name == "" ? f_v3TfName(group.nativeTf) : group.name) : ""
+                if v3PanelTimerInput
+                    liveCountdown = not na(group.live) and barstate.isrealtime and not barstate.isconfirmed and timenow < group.live.boundary
+                    textValue += "\n" + (liveCountdown ? f_v3Countdown(group.live.boundary) : "n/a")
+                textValue += array.size(candles) < group.desired ? "\n" + str.tostring(array.size(candles)) + "/" + str.tostring(group.desired) + " available" : ""
+                if textValue != ""
+                    y = v3PanelLabelPosInput == "Top" ? (v3PanelLabelAlignInput ? rowTop : groupHigh)+labelOffset : (v3PanelLabelAlignInput ? rowBottom : groupLow)-labelOffset
+                    if cursorX <= bar_index + 499
+                        f_v3PanelLabel(int((groupStart+cursorX)/2), y, textValue)
+            cursorX += v3PanelGroupSpaceInput
+            groupIndex += 1
+    if v3PanelInput and v3PanelTraceInput and not na(traceCandle)
+        values = array.from(traceCandle.o,traceCandle.c,traceCandle.h,traceCandle.l)
+        colors = array.from(v3TraceOpenColor,v3TraceCloseColor,v3TraceHighColor,v3TraceLowColor)
+        styles = array.from(v3TraceOpenStyle,v3TraceCloseStyle,v3TraceHighStyle,v3TraceLowStyle)
+        traceWidths = array.from(v3TraceOpenWidth,v3TraceCloseWidth,v3TraceHighWidth,v3TraceLowWidth)
+        for i = 0 to 3
+            value = array.get(values,i)
+            f_v3PanelLine(traceCandle.bIdx, value, traceX, value, array.get(colors,i), f_v3Style(array.get(styles,i)), array.get(traceWidths,i))
+            if v3PanelPriceInput
+                f_v3PanelLabel(traceX,value,str.tostring(value,format.mintick))
+    status = ""
+    if omitted > 0
+        status += "Panel: " + str.tostring(omitted) + " candles hidden to keep drawing space.\n"
+    if skippedSlots > 0 and v3PanelInput
+        status += "Panel: " + str.tostring(skippedSlots) + " slot(s) hidden, set at or below your chart timeframe.\n"
+    if truncatedGroups > 0 and v3PanelInput
+        status += "Panel: " + str.tostring(truncatedGroups) + " group(s) beyond the group limit; raise Next eligible groups to see them.\n"
+    if totalBars > futureBudget
+        status += "Panel: future-bar budget still exceeded after trimming.\n"
