@@ -63,6 +63,7 @@ class RinoConfig:
     tf2_draws_in_tf1_target_math: bool = False
     # V3 setups / key levels (shared blocks per screenshots)
     retained_ts_events: int = 12
+    stop_buffer_ticks: int = 1          # v3StopTicksInput (P5)
     q1: bool = True
     q2: bool = True
     q3: bool = True

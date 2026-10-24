@@ -95,7 +95,8 @@ class DolEngine:
                 r.confluent = False
 
     # ---------------------------------------------------------------- driver
-    def run(self, df: pd.DataFrame, tf1eng, between=None):
+    def run(self, df: pd.DataFrame, tf1eng, between=None, after=None,
+            on_tf2=None, tf2=None):
         self._tf1eng = tf1eng
         cfg = self.cfg
         self.first_observed = df.index[0]
@@ -108,18 +109,28 @@ class DolEngine:
             p = f"a{i}"
             df = attach_native(df, a.tf, p)
             anchor_cols.append((i, a, p))
+        tf2p = None
+        if on_tf2 is not None and tf2 is not None:
+            tf2p = "t2"
+            df = attach_native(df, tf2, tf2p)
         mask = df["tf1_roll"]
         for _, a, p in anchor_cols:
             mask = mask | df[f"{p}_roll"]
+        if tf2p:
+            mask = mask | df[f"{tf2p}_roll"]
         for t, row in df[mask].iterrows():
             if row["tf1_roll"]:
                 self._on_tf1_consume(t, row, tf1eng)
                 if between is not None:
                     between(t, row)          # orchestrator hook (episodes), DR-07 midpoint
                 self._on_tf1_touch(t, row, tf1eng)
+                if after is not None:
+                    after(t, row)            # orchestrator hook (owner monitor + setups)
             for i, a, p in anchor_cols:
                 if row[f"{p}_roll"]:
                     self._on_anchor(t, row, a, p)
+            if tf2p and row[f"{tf2p}_roll"]:
+                on_tf2(t, row)
         return df
 
     def _on_tf1(self, t, row, tf1eng):

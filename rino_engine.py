@@ -38,7 +38,10 @@ from rino_config import config_for
 from rino_clocks import key_time_at
 from rino_tf1 import Tf1Anatomy
 from rino_dol import DolEngine, tf_key
-from rino_episode import ClosedCandle, SweepableDraw, PriorityLayer, EpisodeMachine
+from rino_episode import (ClosedCandle, SweepableDraw, PriorityLayer,
+                          EpisodeMachine, priority_direction)
+from rino_tf2 import Tf2Structure
+from rino_setup import SetupEngine
 
 SYMBOL = "EURUSD"
 MINTICK = 1e-5          # EURUSD family; JPY family uses 1e-3
@@ -51,6 +54,16 @@ class RinoEngine:
         self.tf1 = Tf1Anatomy(cfg)
         self.dol = DolEngine(cfg, mintick)
         self.ep = EpisodeMachine(cfg.tf1_lookback, cfg.tf1_sub_lookback)
+        k1 = tf_key(cfg.tf1)
+        self.rank_of = {"tf1_key": k1, "1D": 1.0, "4h": 4 / 24.0, "1W": 7.0,
+                          "1M": 30.4375, "3M": 91.3125, "15min": 15 / 1440.0,
+                          "30min": 30 / 1440.0, "1h": 1 / 24.0}
+        self.rank_of.setdefault(k1, 1.0)
+        self.tf2 = Tf2Structure(cfg)
+        self.setup = SetupEngine(cfg, mintick, k1, self.rank_of)
+        self.tf2_index = {}
+        self._comps = []
+        self._prio_dir = 0
         self.tf1_origins = []        # confirmed cbuckets, roll order
         self.completions = []        # completed-episode records (raw setups)
         self._df = None              # M15 frame kept for the ADD-01 raid lookup
@@ -91,9 +104,22 @@ class RinoEngine:
                      if r.tf_key == k1 and r.role != ""
                      and r.state in (0, 1) and r.coverage]
         layers = self._priority_layers(origin)
+        self._prio_dir = priority_direction((candle.h + candle.l) / 2.0, layers, k1)
         for comp in self.ep.process_roll(candle, window_origin, sweepable,
                                          layers, tf1_key=k1, admit_dirs=admit):
             self.completions.append(self._record(comp, candle))
+            self._comps.append(comp)
+
+    def _post_touch(self, t, row):
+        self.setup.on_tf1_after(
+            t, row, self._comps, self.dol, self._prio_dir,
+            key_time_raid=lambda d, ep: self._raid_hit(
+                d, ep.origin, ep.boundary,
+                ep.close_ref_low if d == 1 else ep.close_ref_high))
+        self._comps = []
+
+    def _tf2_step(self, t, row):
+        self.setup.on_tf2(t, row["tf2_cbucket"], row["tf2_close"], self.tf2_index, self.dol)
 
     def _priority_layers(self, episode_origin):
         """Live-source f_v3PriorityDir predicate: covered PDOLs state-0 OR disturbed
@@ -119,6 +145,20 @@ class RinoEngine:
         return layers
 
     # ------------------------------------------------------------------ ADD-01 raid
+    def _raid_hit(self, direction, origin, boundary, pool):
+        span = self._df.loc[origin:boundary] if self._df is not None else []
+        if hasattr(span, "empty") and span.empty:
+            return False
+        if not len(span) or pool is None:
+            return False
+        if direction == 1:
+            hit = span[span["low"] <= pool]
+        else:
+            hit = span[span["high"] >= pool]
+        if not len(hit):
+            return False
+        return key_time_at(hit.index[0], self.cfg.key_times) != ""
+
     def _key_time_raid(self, rec):
         """First LTF bar inside the episode span whose range crosses the pool level
         (close reference), mapped onto the fixed-UTC+1 key-time windows."""
@@ -156,7 +196,13 @@ class RinoEngine:
     def run(self, df):
         self._df = df
         df = self.tf1.run(df)
-        df = self.dol.run(df, self.tf1, between=self._episode_step)
+        df = self.tf2.run(df)
+        for sw in self.tf2.swings:
+            if sw.end_reason == "invalidated":
+                self.tf2_index.setdefault((sw.end_time, sw.observed_at), []).append(sw)
+        df = self.dol.run(df, self.tf1, between=self._episode_step,
+                          after=self._post_touch, on_tf2=self._tf2_step,
+                          tf2=self.cfg.tf2)
         return df
 
     def frame(self):
@@ -182,8 +228,23 @@ if __name__ == "__main__":
               f"two-sided: {int(comp.twoSided.sum())} | "
               f"key-time raid: {int(comp.keyTimeSweep.sum())}")
         print(f"raid windows: {comp[comp.keyTimeSweep].raidWindow.value_counts().to_dict()}")
+    st = pd.DataFrame(eng.setup.all_setups())
+    if len(st):
+        print(f"setups: {len(st)} | actionable {int(st.actionable.sum())} | "
+              f"CONTEXT {int((~st.actionable).sum())}")
+        print(f"  class: {st.setupClass.value_counts().to_dict()}")
+        act = st[st.actionable]
+        if len(act):
+            print(f"  grades (actionable): {act.grade.value_counts().to_dict()}")
+            print(f"  targets: {act.targetTf.value_counts().to_dict()} | "
+                  f"median R: {(act.r5 / (act.entry - act.stop).abs()).median():.1f}")
+        tr = [x for x in eng.setup.events if x["kind"] == "RANGE_STATE"]
+        print(f"  owner transitions: {pd.Series([x['to'] for x in tr]).value_counts().to_dict() if tr else {}}")
+    print(f"trend state: {eng.setup.tsm.dir} | pending {eng.setup.tsm.pend_side}")
     os.makedirs("reports", exist_ok=True)
     out = f"reports/episodes_{SYMBOL}.csv"
     comp.to_csv(out, index=False)
     ev.to_csv(f"reports/episode_events_{SYMBOL}.csv", index=False)
-    print(f"\nsaved {out} ({len(comp)} raw setups) + episode events ({len(ev)})")
+    if len(st):
+        st.to_csv(f"reports/setups_{SYMBOL}.csv", index=False)
+    print(f"\nsaved {out} + setups_{SYMBOL}.csv ({len(st)} graded setups)")
