@@ -12,9 +12,15 @@ DR-07 is structural: the `between` hook runs the episode scan AFTER consumption 
 BEFORE touching, exactly as frozen CORE.
 
 EXTENT NOTES (D-PY-16):
-- The opening scan covers TF1 PDOL records ONLY, per executed code C:L2113..L2128
-  (`for lvlW in tf1Levels`). The M-1c comment claims anchors are sweepable too;
-  the executed code is the port authority. Divergence flagged, not "fixed".
+- OPENING SCAN (D-PY-20 + D-PY-22, architect rulings): sweep = FLAT, any in-window
+  TF1 candle extreme, PDOL or SDOL, eligible while not closed through (state 0/1;
+  re-sweeps register). Admission = DRAW-ANCHORED: undisturbed covered PDOLs on TF1
+  AND ACTIVE anchors set the direction; swept side is the opposite one; the close
+  confirms; no undisturbed draw -> no event. Diverges from frozen C:L2115-2120
+  (PDOL-only, TF1-only scan, state-0-only): the port follows the rulings; logged.
+- QUEUED (D-PY-21 taxonomy): TF2 sweep through a draw = operator CAUTION (not a
+  kill); TF1-swept PDOLs are dead for TARGETING but alive for setup events; TF1
+  close-through consumes and targeting moves to the next undisturbed PDOL.
 - f_v3PriorityDir (live source) admits covered PDOLs that are state-0 OR disturbed
   at/after the episode origin (dolChangedAt >= origin). _priority_layers mirrors it.
 - ADD-01 rev 2 (D-PY-06): key-time raid = first LTF bar inside the episode span whose
@@ -61,14 +67,32 @@ class RinoEngine:
                               l=row["tf1_low"], c=row["tf1_close"],
                               origin=origin, boundary=t)
         k1 = tf_key(self.cfg.tf1)
+        # DPY-20/22 (architect rulings): the sweep starts FLAT — any in-window TF1 candle
+        # extreme, PDOL or SDOL, eligible while NOT closed through (state 0 OR 1: the
+        # re-sweep case, "the setup candle gets swept one more time before the move").
+        # Admission is DRAW-ANCHORED (D-PY-22): undisturbed covered PDOLs on TF1 AND
+        # ACTIVE anchors set the expected direction; the swept side is the opposite one;
+        # no undisturbed draw -> no event. Deliberate divergence from frozen C:L2115-2120.
+        active_anchor_keys = {tf_key(a.tf) for a in self.cfg.anchors
+                              if a.enabled and tf_key(a.tf) != k1}
+        draws = [r for r in self.dol.records.values()
+                 if r.role == "PDOL" and r.state == 0 and r.coverage
+                 and (r.tf_key == k1 or r.tf_key in active_anchor_keys)]
+        admit = set()
+        for r in draws:
+            side = r.owner.kind if hasattr(r.owner, "kind") else r.owner.side
+            if side == "High":
+                admit.add(1)     # draw above -> LONG on low sweeps
+            else:
+                admit.add(-1)    # draw below -> SHORT on high sweeps
         sweepable = [SweepableDraw(price=r.owner.price, side=r.owner.kind,
                                    origin=r.owner.origin, tf_key=k1)
                      for r in self.dol.records.values()
-                     if r.tf_key == k1 and r.role == "PDOL"
-                     and r.state == 0 and r.coverage]
+                     if r.tf_key == k1 and r.role != ""
+                     and r.state in (0, 1) and r.coverage]
         layers = self._priority_layers(origin)
         for comp in self.ep.process_roll(candle, window_origin, sweepable,
-                                         layers, tf1_key=k1):
+                                         layers, tf1_key=k1, admit_dirs=admit):
             self.completions.append(self._record(comp, candle))
 
     def _priority_layers(self, episode_origin):

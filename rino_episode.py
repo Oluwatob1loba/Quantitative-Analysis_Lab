@@ -172,9 +172,18 @@ class EpisodeMachine:
                      window_origin: Optional[int],
                      sweepable: list,
                      priority_layers: list,
-                     tf1_key: str = "1D") -> list:
+                     tf1_key: str = "1D",
+                     admit_dirs: Optional[set] = None) -> list:
         """Returns the list[Completion] if the episode completed this roll,
-        else []. Side effects: pending episode state + events."""
+        else []. Side effects: pending episode state + events.
+
+        admit_dirs (D-PY-22): draw-anchored admission. If None (fixtures),
+        behavior is unchanged (both directions). If a set, only those
+        directions may open/complete: an episode opens only when a swept side
+        maps to an admitted direction (swept lows -> LONG needs a PDOL High
+        draw; swept highs -> SHORT needs a PDOL Low draw), and completions are
+        enumerated only for admitted directions. Empty set -> no event.
+        """
 
         # -- zombie guard (C:L2101-L2102, DR-18) ----------------------------
         if self.pending is not None and self.pending.candles > self.lookback:
@@ -198,6 +207,11 @@ class EpisodeMachine:
                            and candle.h > d.price)
             if not lows and not highs:
                 return []
+            if admit_dirs is not None:
+                # D-PY-22: open only if a swept side maps to an admitted
+                # direction (opposite-side undisturbed draw exists).
+                if not ((lows and 1 in admit_dirs) or (highs and -1 in admit_dirs)):
+                    return []
             ep = Episode(
                 reference_time=window_origin,
                 range_high=max(highs) if highs else candle.h,   # DR-05 fallback
@@ -242,6 +256,8 @@ class EpisodeMachine:
         variant = "Window" if ep.candles == 1 else "WindowMulti"
         completions = []
         for cand in (first, -first):
+            if admit_dirs is not None and cand not in admit_dirs:
+                continue
             qualifies = ((cand == 1 and long_ready)
                          or (cand == -1 and short_ready))
             if qualifies:
