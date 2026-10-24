@@ -95,7 +95,7 @@ class DolEngine:
                 r.confluent = False
 
     # ---------------------------------------------------------------- driver
-    def run(self, df: pd.DataFrame, tf1eng):
+    def run(self, df: pd.DataFrame, tf1eng, between=None):
         self._tf1eng = tf1eng
         cfg = self.cfg
         self.first_observed = df.index[0]
@@ -113,7 +113,10 @@ class DolEngine:
             mask = mask | df[f"{p}_roll"]
         for t, row in df[mask].iterrows():
             if row["tf1_roll"]:
-                self._on_tf1(t, row, tf1eng)
+                self._on_tf1_consume(t, row, tf1eng)
+                if between is not None:
+                    between(t, row)          # orchestrator hook (episodes), DR-07 midpoint
+                self._on_tf1_touch(t, row, tf1eng)
             for i, a, p in anchor_cols:
                 if row[f"{p}_roll"]:
                     self._on_anchor(t, row, a, p)
@@ -158,6 +161,57 @@ class DolEngine:
                     rec.state, rec.changed_at = 1, t
                     self._emit(rec, origin, t)
         self._recompute_confluence()
+
+    # ---------------------------------------------------------------- phases (D-PY-19)
+    # DR-07 ordering split, additive: frozen CORE consumes draws (strict close, state 2)
+    # BEFORE the episode opening scan and touches them (wick, state 0->1) AFTER it
+    # (C:L519..L531 consumption; C:L2113..L2128 opening scan; C:L2137..L2145 touch pass).
+    # run(between=None) composes consume->touch back-to-back = identical behavior to the
+    # fused version; the orchestrator passes `between` to interleave the episode machine.
+    def _on_tf1_consume(self, t, row, tf1eng):
+        c = row["tf1_close"]
+        origin = row["tf1_cbucket"]
+        self._tf1_origins.append(origin)
+        lb = self.cfg.tf1_lookback
+        cutoff = self._tf1_origins[-lb] if len(self._tf1_origins) >= lb else None
+        if cutoff is not None:
+            for key in [k for k, r in self.records.items()
+                        if r.tf_key == tf_key(self.cfg.tf1) and r.owner.origin < cutoff]:
+                del self.records[key]
+        direction = "up" if c > row["tf1_open"] else "down" if c < row["tf1_open"] else "neutral"
+        for lv in tf1eng.levels:
+            if lv.origin == origin and lv.kind in ("High", "Low"):
+                role = "" if direction == "neutral" else (
+                    "PDOL" if (direction == "up") == (lv.kind == "High") else "SDOL")
+                self.records[(tf_key(self.cfg.tf1), str(origin), lv.kind)] = DolRecord(
+                    owner=lv, tf_key=tf_key(self.cfg.tf1), role=role, coverage=True)
+        for key, rec in list(self.records.items()):
+            if rec.tf_key != tf_key(self.cfg.tf1) or rec.state >= 2 or rec.role == "":
+                continue
+            lv = rec.owner
+            broke = (lv.kind == "High" and c > lv.price) or (lv.kind == "Low" and c < lv.price)
+            if broke:
+                rec.state, rec.changed_at = 2, t
+                self._emit(rec, origin, t)
+        self._recompute_confluence()
+
+    def _on_tf1_touch(self, t, row, tf1eng=None):
+        h, l = row["tf1_high"], row["tf1_low"]
+        origin = row["tf1_cbucket"]
+        for key, rec in list(self.records.items()):
+            if rec.tf_key != tf_key(self.cfg.tf1) or rec.state != 0 or rec.role == "":
+                continue
+            lv = rec.owner
+            if origin > lv.available_at:
+                touched = (lv.kind == "High" and h >= lv.price) or (lv.kind == "Low" and l <= lv.price)
+                if touched:
+                    rec.state, rec.changed_at = 1, t
+                    self._emit(rec, origin, t)
+        self._recompute_confluence()
+
+    def _on_tf1(self, t, row, tf1eng):
+        self._on_tf1_consume(t, row, tf1eng)
+        self._on_tf1_touch(t, row, tf1eng)
 
     def _on_anchor(self, t, row, a, p):
         c, h, l = row[f"{p}_close"], row[f"{p}_high"], row[f"{p}_low"]
