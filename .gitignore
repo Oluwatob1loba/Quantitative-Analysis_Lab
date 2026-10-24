@@ -1,0 +1,7 @@
+__pycache__/
+.vscode/
+.kilo/
+data/
+reports/
+*.pyc
+MT5_Pass.png

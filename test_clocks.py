@@ -32,8 +32,10 @@ for tf, prefix, step_days in (("1D", "d", 1), ("1W", "w", 7)):
     prev = df[(df.index >= b - pd.Timedelta(days=step_days)) & (df.index < b)]
     ok1 = abs(d.loc[bar, f"{prefix}_high"] - prev["high"].max()) < 1e-9
     prev_bar = d.index[d.index.get_loc(bar) - 1]
-    b2 = bucket_start(prev_bar, tf)
-    prev2 = df[(df.index >= b2 - pd.Timedelta(days=step_days)) & (df.index < b2)]
+    # TEST-PY-03: window the EXPOSED confirmed bucket itself. Calendar-day offsets break across
+    # weekends (Monday's prior window is empty) — the bar exposes the previous native candle.
+    b_prev_conf = d.loc[prev_bar, f"{prefix}_cbucket"]
+    prev2 = df[(df.index >= b_prev_conf) & (df.index < b_prev_conf + pd.Timedelta(days=step_days))]
     ok2 = abs(d.loc[prev_bar, f"{prefix}_high"] - prev2["high"].max()) < 1e-9
     print(f"  @roll: exposed high = confirmed prev bucket -> {'MATCH' if ok1 else 'MISMATCH'}")
     print(f"  @bar-before-roll: one step behind, no lookahead -> {'MATCH' if ok2 else 'MISMATCH'}")

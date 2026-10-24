@@ -100,8 +100,13 @@ class Tf2Structure:
                 self.pending_critical.append(s)
             return
         h, l = rec
-        prox = min(abs(s.price - h), abs(s.price - l)) / s.price * 100.0
-        s.is_critical = prox <= self.cfg.tf2_critical_proximity_pct
+        if getattr(self.cfg, "critical_side_matched", True):       # D-PY-18: frozen C:L457..L497
+            pp = h if s.side == "High" else l                      # side-matched, denom=abs(parent)
+            s.is_critical = (s.price == 0.0) if pp == 0.0 else \
+                (100.0 * abs(s.price - pp) / abs(pp) <= self.cfg.tf2_critical_proximity_pct)
+        else:                                                      # legacy min-distance variant
+            prox = min(abs(s.price - h), abs(s.price - l)) / s.price * 100.0
+            s.is_critical = prox <= self.cfg.tf2_critical_proximity_pct
         s.critical_at = t
         if s.is_critical:
             self.counters["critical"] += 1
@@ -178,8 +183,10 @@ class Tf2Structure:
     def _on_tf1(self, t, bucket, h, l, c):
         self.tf1_hist.append((bucket, h, l, c))
         self._tf1_by_bucket[bucket] = (h, l)
-        for s in list(self.pending_critical):                        # retry deferred Criticals
-            if s.parent_bucket < bucket:
+        for s in list(self.pending_critical):            # retry deferred Criticals
+            # Resolved when the parent candle itself is the just-confirmed one (<= cbucket):
+            # frozen f_testCritical resolves iff originTime < developing boundary.
+            if s.parent_bucket <= bucket:
                 self._resolve(s, t)
         if self.cfg.tf2_anchor_to_tf1:                               # TF1-anchored horizon
             origins = [x[0] for x in self.tf1_hist]
@@ -193,10 +200,13 @@ class Tf2Structure:
             df = attach_native(df, self.cfg.tf2, "tf2")
         for t, row in df[df["tf1_roll"] | df["tf2_roll"]].iterrows():
             if row["tf1_roll"]:
-                self._on_tf1(t, row["tf1_bucket"], row["tf1_high"], row["tf1_low"], row["tf1_close"])
+                # BUG-PY-05 fix: key by the CONFIRMED candle's own bucket (cbucket, D-PY-17),
+                # not the developing bucket. Developing-keying tested every Critical against
+                # the previous candle's extremes and resolved one roll early.
+                self._on_tf1(t, row["tf1_cbucket"], row["tf1_high"], row["tf1_low"], row["tf1_close"])
             if row["tf2_roll"]:
                 self._on_tf2(t, row["tf2_open"], row["tf2_high"], row["tf2_low"],
-                             row["tf2_close"], row["tf2_bucket"])
+                row["tf2_close"], row["tf2_cbucket"])
         return df
 
     def frame(self) -> pd.DataFrame:

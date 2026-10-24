@@ -51,6 +51,10 @@ class RinoConfig:
     tf2_highlight_critical: bool = True
     tf2_critical_proximity_pct: float = 0.1
     tf2_critical_on_minor: bool = True
+    # D-PY-18: True = frozen-source semantics (High vs parent High, Low vs parent Low,
+    # denominator abs(parentPrice); C:L457..L497, P4.2). False = legacy min-distance
+    # variant. Pending architect ratification; handover recommends True (§18.1).
+    critical_side_matched: bool = True
     tf2_faded_opacity_pct: int = 30
     # Anchors
     anchors: List[AnchorCfg] = field(default_factory=list)

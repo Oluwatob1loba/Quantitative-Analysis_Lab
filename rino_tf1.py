@@ -42,7 +42,7 @@ class Tf1Anatomy:
             df = attach_native(df, self.cfg.tf1, p)
         for t, row in df[df[f"{p}_roll"]].iterrows():
             h, l, c = row[f"{p}_high"], row[f"{p}_low"], row[f"{p}_close"]
-            origin = row[f"{p}_bucket"]
+            origin = row[f"{p}_cbucket"]      # confirmed candle's own open (D-PY-17)
             if pd.isna(c):
                 continue
             # 1. strict close-only invalidation, by stored polarity, High/Low only

@@ -16,9 +16,9 @@ print(f"swings: {len(f)} | majors: {len(eng.majors)} | "
       f"unresolved deferred: {len(eng.pending_critical)}")
 
 d = attach_native(df, cfg.tf2, "tf2")
-cbc = d[d["tf2_roll"]].set_index("tf2_bucket")["tf2_close"]
+cbc = d[d["tf2_roll"]].set_index("tf2_cbucket")["tf2_close"]
 tf1d = attach_native(df, cfg.tf1, "tf1")
-hist = {r["tf1_bucket"]: (r["tf1_high"], r["tf1_low"])
+hist = {r["tf1_cbucket"]: (r["tf1_high"], r["tf1_low"])
         for _, r in tf1d[tf1d["tf1_roll"]].iterrows()}
 
 alt = all(a.side != b.side for a, b in zip(eng.majors, eng.majors[1:]))
@@ -43,10 +43,16 @@ for s in eng.swings:
     if s.is_critical is None:
         continue
     h, l = hist[s.parent_bucket]
-    want = min(abs(s.price - h), abs(s.price - l)) / s.price * 100 <= cfg.tf2_critical_proximity_pct
+    if cfg.critical_side_matched:                    # D-PY-18: gate mirrors the engine flag
+        pp = h if s.side == "High" else l
+        want = (s.price == 0.0) if pp == 0.0 else \
+               (100.0 * abs(s.price - pp) / abs(pp) <= cfg.tf2_critical_proximity_pct)
+    else:
+        want = min(abs(s.price - h), abs(s.price - l)) / s.price * 100 <= cfg.tf2_critical_proximity_pct
     if want != s.is_critical:
         bad4 += 1
-print(f"Gate 4 Critical proximity reproducible   : {'PASS' if bad4 == 0 else f'FAIL {bad4}'}")
+print(f"Gate 4 Critical reproducible (side-matched={cfg.critical_side_matched})"
+      f": {'PASS' if bad4 == 0 else f'FAIL {bad4}'}")
 
 act = f[f.end_reason == ""]
 ok5 = eng.cutoff is not None and bool((act["origin"] >= eng.cutoff).all())

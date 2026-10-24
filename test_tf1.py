@@ -14,7 +14,9 @@ print(f"stamped {len(f):,} levels")
 print(f.groupby(["kind", "end_reason"]).size().to_string())
 
 d = attach_native(df, cfg.tf1, "tf1")
-conf = d[d["tf1_roll"]][["tf1_bucket", "tf1_close"]].dropna().set_index("tf1_bucket")["tf1_close"]
+# TEST-PY-02: key by the CONFIRMED bucket (cbucket, D-PY-17). tf1_bucket keys the breaking
+# candle's close by the NEXT roll, so the strict-close check compared against the wrong candle.
+conf = d[d["tf1_roll"]][["tf1_cbucket", "tf1_close"]].dropna().set_index("tf1_cbucket")["tf1_close"]
 
 # Gate 1: every invalidation is a STRICT close break, and end_time is the breaking candle's open
 inv = f[f.end_reason == "invalidated"]

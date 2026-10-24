@@ -21,7 +21,7 @@ print(f"events: {len(eng.events)} | anchor draws: {len(eng.anchors)} | "
 
 # Gate 1: roles match body direction on every TF1 record
 d = attach_native(df, cfg.tf1, "tf1")
-oc = d[d["tf1_roll"]].set_index("tf1_bucket")[["tf1_open", "tf1_close"]]
+oc = d[d["tf1_roll"]].set_index("tf1_cbucket")[["tf1_open", "tf1_close"]]
 bad1 = 0
 for r in recs:
     if r.tf_key != cfg.tf1 or r.role == "":
@@ -30,6 +30,9 @@ for r in recs:
     want = "PDOL" if ((c > o) == (r.owner.kind == "High")) else "SDOL"
     if want != r.role:
         bad1 += 1
+        if bad1 <= 20:   # offender diagnostics: the real lake names the truth (handover §13)
+            print(f"   G1 offender: origin={r.owner.origin} kind={r.owner.kind} stored={r.role} "
+                  f"want={want} O={o} C={c} state={r.state} changed_at={r.changed_at}")
 print(f"Gate 1 roles from body direction        : {'PASS' if bad1 == 0 else f'FAIL {bad1}'}")
 
 # Gate 2: monotone states, stamps present
@@ -42,29 +45,43 @@ leaked = [e for e in eng.events if e["role"] == "SDOL" and e["state"] == 0]
 print(f"Gate 3 untouched SDOL silent ({len(silent)} exist): {'PASS' if not leaked else 'FAIL'}")
 
 # Gate 4: sweep/consume predicates reproduce on a sample
+# Roll-bar -> confirmed-bucket map: the candle that CAUSED a transition stamped at
+# changed_at is the confirmed candle of THAT roll, never the level's own origin candle.
+
+# ---------------------------------------------------------------------------
+# Gate 4 (corrected, self-contained): sweep/consume predicates reproduce on the
+# CAUSING candle, located via the roll-bar -> confirmed-bucket map. A level's own
+# origin candle can never be its breaker (a candle never closes above its own high
+# or below its own low) — that is exactly why the old lookup failed 11/11 on
+# consumed rows. Defines its own imports and samples so no edit can orphan it.
+# ---------------------------------------------------------------------------
 import random
 s1 = [r for r in recs if r.state == 1]
 s2 = [r for r in recs if r.state == 2]
-hb = d[d["tf1_roll"]].set_index("tf1_bucket")[["tf1_high", "tf1_low", "tf1_close"]]
+hb = d[d["tf1_roll"]].set_index("tf1_cbucket")[["tf1_high", "tf1_low", "tf1_close"]]
+bucket_at = d[d["tf1_roll"]]["tf1_cbucket"]   # roll bar -> the CONFIRMED candle that caused the stamp
+
 bad4 = 0
 for r in random.Random(7).sample(s1, min(25, len(s1))):
-    row = hb.loc[r.owner.origin] if r.tf_key == cfg.tf1 else None
-    if row is None:
+    if r.tf_key != cfg.tf1:
         continue
-    side = r.owner.kind if r.tf_key == cfg.tf1 else r.owner.side
+    row = hb.loc[bucket_at.loc[r.changed_at]]
+    side = r.owner.kind
     touched = (row["tf1_high"] >= r.owner.price) if side == "High" else (row["tf1_low"] <= r.owner.price)
     broke = (row["tf1_close"] > r.owner.price) if side == "High" else (row["tf1_close"] < r.owner.price)
     if not touched or broke:
         bad4 += 1
+        print("   G4 sweep miss:", side, r.owner.price, r.changed_at)
 for r in random.Random(11).sample(s2, min(25, len(s2))):
     if r.tf_key != cfg.tf1:
         continue
-    row = hb.loc[r.owner.origin]
+    row = hb.loc[bucket_at.loc[r.changed_at]]
     side = r.owner.kind
     broke = (row["tf1_close"] > r.owner.price) if side == "High" else (row["tf1_close"] < r.owner.price)
     if not broke:
         bad4 += 1
-print(f"Gate 4 sweep/consume predicates sample  : {'PASS' if bad4 == 0 else f'FAIL {bad4}'}")
+        print("   G4 consume miss:", side, r.owner.price, r.changed_at)
+print(f"Gate 4 sweep/consume on causing candle     : {'PASS' if bad4 == 0 else f'FAIL {bad4}'}")
 
 # Gate 5: confluence symmetric and cross-key
 bad5 = 0
@@ -95,15 +112,22 @@ print(f"Gate 5 confluence cross-key symmetric   : {'PASS' if bad5 == 0 else f'FA
 # A failure here means the lifecycle is reading same-roll or future data it is not
 # entitled to — the exact failure class DR-02 exists to prevent.
 # ---------------------------------------------------------------------------
+# Gate 6 (corrected): eligibility, plus attribution IDENTITY (end_time must equal the
+# breaking candle's own open bucket and precede the detection roll).
 bad6 = 0
 for r in recs:
     if r.tf_key != cfg.tf1 or r.state == 0:
         continue
     if r.changed_at is None or r.changed_at <= r.owner.available_at:
-        bad6 += 1                                    # 6a: disturbed before eligible
-    if r.state == 2 and r.owner.end_time is not None and not (r.owner.end_time < r.changed_at):
-        bad6 += 1                                    # 6b: attribution not before detection
-print(f"Gate 6 eligibility + attribution<detection : {'PASS' if bad6 == 0 else f'FAIL {bad6}'}")
+        bad6 += 1
+        print("   G6a eligibility:", r.owner.kind, r.owner.price, r.changed_at, r.owner.available_at)
+        continue
+    if r.state == 2:
+        cb = bucket_at.loc[r.changed_at]
+        if r.owner.end_time != cb or not (r.owner.end_time < r.changed_at):
+            bad6 += 1
+            print("   G6b attribution:", r.owner.kind, r.owner.price, r.owner.end_time, "vs causing", cb, "detected", r.changed_at)
+print(f"Gate 6 eligibility + attribution identity  : {'PASS' if bad6 == 0 else f'FAIL {bad6}'}")
 
 # ---------------------------------------------------------------------------
 # Gate 7 — the confluence pool is bounded by retention (BUG-PY-02 sentinel).

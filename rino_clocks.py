@@ -54,6 +54,12 @@ def attach_native(df: pd.DataFrame, tf: str, prefix: str) -> pd.DataFrame:
     out[f"{prefix}_roll"] = roll
     for c in ("open", "high", "low", "close", "tick_volume"):
         out[f"{prefix}_{c}"] = mapped[c].to_numpy()
+    # Confirmed-bucket label (D-PY-17): the bucket whose OHLC the exposed columns
+    # carry, i.e. the last COMPLETED native candle as of this chart bar. Distinct
+    # from {prefix}_bucket (the developing bucket). Origins, endTime and pivot
+    # stamps use cbucket; detection/availability stamps use the roll bar.
+    prev_buckets = pd.Series(g.index.to_numpy()[:-1], index=g.index.to_numpy()[1:])
+    out[f"{prefix}_cbucket"] = prev_buckets.reindex(buckets).to_numpy()
     return out
 
 

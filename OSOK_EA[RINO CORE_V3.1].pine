@@ -1655,6 +1655,7 @@ type V3Setup
     int confluenceLayers = 0
     bool intactPrimary = false
     string contextReason = ""
+    string poiDiag = ""
     box zoneId = na
     label labelId = na
     line highId = na
@@ -1839,7 +1840,9 @@ f_v3AddGap(string kind, string nativeTf, int direction, float lower, float upper
 // condition that failed (scanned FVGs / direction-matched / penetrated / fill-ok / timing-ok /
 // layer-enabled). Setup state must be chart-invariant below TF1; when two charts disagree, the
 // breakdown identifies which conjunct diverged instead of leaving us to guess.
-f_v3PoiGate(int direction, float sweptExtreme, int originTime, int boundaryTime, float winLow, float winHigh) =>
+// Lever 3 (F-strict): The POI band must physically intersect the operative rejection slice.
+// No more half-line or frozen-window overlap tests.
+f_v3PoiGate(int direction, int originTime, int boundaryTime, float sliceLo, float sliceHi) =>
     bool hit = false
     int scanned = 0
     int dirMatch = 0
@@ -1847,34 +1850,37 @@ f_v3PoiGate(int direction, float sweptExtreme, int originTime, int boundaryTime,
     int fillOk = 0
     int timingOk = 0
     int layerOn = 0
+    string witness = ""
     for gap in v3Gaps
-        if gap.kind == "FVG"
+        if gap.kind == "FVG" 
             scanned += 1
             if gap.direction == direction
                 dirMatch += 1
-                penetrated = (direction == 1 ? sweptExtreme <= gap.upper : sweptExtreme >= gap.lower) or (gap.upper >= winLow and gap.lower <= winHigh)
+                // Penetration requires the band to intersect the operative slice.
+                penetrated = gap.upper >= sliceLo and gap.lower <= sliceHi
                 if penetrated
                     penMatch += 1
-                    // CLOSE-2 (owner ruling, gold + USDJPY daily fixtures): a zone the soup traded
-                    // through IS souped, even if an earlier complete candle filled it before origin.
-                    // Fill state stays recorded for tags/export and in the fillOk counter, but the
-                    // timing/layer checks no longer sit inside the fill test.
-                    if na(gap.endedAt) or gap.endedAt > originTime
+                    // PAINT ON THE WALL: If a previous candle closed through the gap, it is 
+                    // permanently invalidated. It cannot be souped. We only accept gaps that 
+                    // are either completely unfilled, or filled BY the soup episode itself.
+                    if na(gap.endedAt) or gap.endedAt >= originTime
                         fillOk += 1
                     if gap.availableAt <= boundaryTime
                         timingOk += 1
-                        keyKey = f_v3TfKey(gap.nativeTf)
-                        if keyKey == f_v3TfKey(tf1Input) and v3Tf1FvgInput
-                            layerOn += 1
-                            hit := true
+                    keyKey = f_v3TfKey(gap.nativeTf)
+                    if keyKey == f_v3TfKey(tf1Input) and v3Tf1FvgInput
+                        layerOn += 1
+                        hit := true
+                        if witness == ""
+                            witness := f_v3TfName(gap.nativeTf) + " " + str.format_time(gap.origin, "dd/MM", "UTC") + " " + str.tostring(gap.lower, format.mintick) + "-" + str.tostring(gap.upper, format.mintick) + (na(gap.endedAt) ? " live" : " filled")
     for cand in v3PoiPending
         if cand.direction == direction and cand.availableAt <= boundaryTime
-            penetratedPending = (direction == 1 ? sweptExtreme <= cand.upper : sweptExtreme >= cand.lower) or (cand.upper >= winLow and cand.lower <= winHigh)
+            penetratedPending = cand.upper >= sliceLo and cand.lower <= sliceHi
             if penetratedPending
                 pendKey = f_v3TfKey(cand.nativeTf)
                 if pendKey == f_v3TfKey(tf1Input) and v3Tf1FvgInput
                     hit := true
-    [hit, "scanned " + str.tostring(scanned) + " dir " + str.tostring(dirMatch) + " pen " + str.tostring(penMatch) + " fill " + str.tostring(fillOk) + " time " + str.tostring(timingOk) + " layer " + str.tostring(layerOn) + " pend " + str.tostring(array.size(v3PoiPending))]
+    [hit, "scanned " + str.tostring(scanned) + " dir " + str.tostring(dirMatch) + " pen " + str.tostring(penMatch) + " fill " + str.tostring(fillOk) + " time " + str.tostring(timingOk) + " layer " + str.tostring(layerOn) + " pend " + str.tostring(array.size(v3PoiPending)) + " via " + witness]
 // Setup class (M-1): A when the confirming candle's own PDOL matches an undisturbed covered PDOL
 // of any priority layer within that layer's last completed candles; B otherwise. Completed-only:
 // the forming candle never carries information (owner rule).
@@ -1892,7 +1898,7 @@ f_v3SetupClass(float manOpen, float manClose, float manHigh, float manLow, float
 // covered PDOL sets preference. A High-side PDOL is liquidity price is anticipated to trade UP
 // to, so longs (low-sweeps) are preferred; a Low-side PDOL prefers shorts. Both sides present:
 // nearest to the episode midpoint wins; exact tie falls through to the next layer.
-f_v3PriorityDir(float referenceValue) =>
+f_v3PriorityDir(float referenceValue, int originTime) =>
     int prio = 0
     for layerIdx = 0 to 3
         layerTf = layerIdx == 0 ? v3Dol1Tf : layerIdx == 1 ? v3Dol2Tf : layerIdx == 2 ? v3Dol3Tf : tf1Input
@@ -1902,7 +1908,7 @@ f_v3PriorityDir(float referenceValue) =>
             float nearHigh = na
             float nearLow = na
             for lvlP in src
-                if (layerIdx == 3 or lvlP.tf == layerTf) and lvlP.dolRole == "PDOL" and lvlP.dolState == 0 and lvlP.dolCoverage
+                if (layerIdx == 3 or lvlP.tf == layerTf) and lvlP.dolRole == "PDOL" and lvlP.dolCoverage and (lvlP.dolState == 0 or (not na(lvlP.dolChangedAt) and lvlP.dolChangedAt >= originTime))
                     if lvlP.isHighLow == "High"
                         nearHigh := na(nearHigh) ? lvlP.price : math.min(nearHigh, lvlP.price)
                     else
@@ -1981,6 +1987,10 @@ f_v3Grade(V3Setup setup, int stamp) =>
         score += setup.intactPrimary ? v3WIntactPrimary : 0
         score += anchorBonus * v3WAnchorPriority
         grade = score >= math.max(v3GradeAInput, v3GradeBInput) ? "A" : score >= math.min(v3GradeAInput, v3GradeBInput) ? "B" : "C"
+        // V3.2 Fix B (owner ratified): same-color-close (class B) setups cap at grade B.
+        // Grade A is reserved for opposing-close confirmations (A/A+).
+        if setup.setupClass == "B" and grade == "A"
+            grade := "B"
         changed = setup.grade != grade or setup.score != score
         setup.grade := grade
         setup.score := score
@@ -2000,6 +2010,7 @@ f_v3TsExport(V3Setup setup) =>
     fields += ",\"setupClass\":" + f_v3Quote(setup.setupClass) + ",\"confluenceLayers\":" + str.tostring(setup.confluenceLayers) + ",\"intactPrimary\":" + f_v3Bool(setup.intactPrimary) + ",\"contextReason\":" + (setup.actionable ? "null" : f_v3Quote(setup.contextReason))
     fields += (not na(setup.t1) ? ",\"t1\":" + str.tostring(setup.t1, format.mintick) : ",\"t1\":null")
     fields += (setup.t1Flipped ? ",\"t1Flipped\":true" : ",\"t1Flipped\":false")
+    fields += (setup.actionable ? ",\"poiDiag\":" + f_v3Quote(setup.poiDiag) : "")
     fields += ",\"tf2PatternFlags\":null"
     f_v3Event("TS", tf1Input, setup.origin, setup.availableAt, fields)
 
@@ -2012,7 +2023,33 @@ bool v3DolRefresh = newTf1Bar
 var int v3FirstObserved = time
 
 
-// Additional anchors share one expression and only create DOL Levels, never another setup engine.
+// =============================================================================================
+// TREND STATE MACHINE (TSM) -- lives with the anchor/roll machinery; no section renumber.
+// Scan authority: Anchor3 -> Anchor2 -> Anchor1 -> TF1. BOS = with-trend close-through
+// (confirm/refresh). CHoCH = counter-side close-through (flip). Anchors flip on their own
+// native close; a TF1 flip is vetoed into caution while any active anchor still holds an
+// undisturbed covered PDOL on the old side. Undefined state falls back to the prioDir veto.
+// =============================================================================================
+var int trendDir = 0
+var int trendSince = na
+var int lastBosAt = na
+var int trendPendSide = 0
+var int trendPendAt = na
+f_v3TsmEvent(string layerTf, float cc, bool isTf1) =>
+    src = isTf1 ? tf1Levels : v3ExtraDols
+    bool bull = false
+    bool bear = false
+    for lvl in src
+        if (isTf1 or lvl.tf == layerTf) and lvl.dolRole == "PDOL" and lvl.dolState == 0 and lvl.dolCoverage
+            if lvl.isHighLow == "High" and cc > lvl.price
+                bull := true
+            if lvl.isHighLow == "Low" and cc < lvl.price
+                bear := true
+    bull and not bear ? 1 : bear and not bull ? -1 : 0
+int ev1 = 0
+int ev2 = 0
+int ev3 = 0
+// Additional anchors share one expression and only create DOL levels, never another setup engine.
 v3ExtraOn = array.from(v3Dol1On, v3Dol2On, v3Dol3On)
 v3ExtraTf = array.from(v3Dol1Tf, v3Dol2Tf, v3Dol3Tf)
 v3ExtraLookback1 = v3Dol1Lookback == 0 ? tf1SubLookbackEff : v3Dol1Lookback == -1 ? lookbackInput : v3Dol1Lookback
@@ -2034,6 +2071,13 @@ for slot = 0 to 2
         if not na(t) and (na(lastStamp) or t != lastStamp)
             v3DolRefresh := true
             array.set(v3ExtraLast, slot, t)
+            evSlot = f_v3TsmEvent(nativeTf, c, false)
+            if slot == 0
+                ev1 := evSlot
+            else if slot == 1
+                ev2 := evSlot
+            else
+                ev3 := evSlot
             f_v3ConsumeExtra(nativeTf, c, h, l, t, boundary)
             // Anchor FVGs share the TF1/TF2 formula and the shared zone stream; each anchor's own
             // toggle decides computation, and these gaps feed the setup key-level gate (M-1).
@@ -2093,12 +2137,40 @@ f_v3OwnerClean(V3Setup owner) =>
             clean := clean or (level.startTime == owner.targetOrigin and f_v3TfKey(nativeTf) == f_v3TfKey(owner.targetTf) and level.dolRole == "PDOL" and level.dolState == 0 and level.dolCoverage)
     clean
 f_v3GapPacket(int age) =>
-    [high[1], low[1], time[1], time_close[1], high[3], low[3], open[1], close[2], high[2], low[2], time[age], time[3], time[2]]
+    [high[1], low[1], time[1], time_close[1], high[3], low[3], open[1], close[1], close[2], high[2], low[2], time[age], time[3], time[2]]
 
-[v3G1H, v3G1L, v3G1T, v3G1End, v3G1H2, v3G1L2, v3G1O, v3G1C1, v3G1H1, v3G1L1, v3G1Cutoff, v3G1Seq, v3G1Prior] = request.security(syminfo.tickerid, tf1Input, f_v3GapPacket(v3GapAgeInput), lookahead = barmerge.lookahead_on)
-[v3G2H, v3G2L, v3G2T, v3G2End, v3G2H2, v3G2L2, v3G2O, v3G2C1, v3G2H1, v3G2L1, v3G2Cutoff, v3G2Seq, v3G2Prior] = request.security(syminfo.tickerid, tf2Input, f_v3GapPacket(v3GapAgeInput), lookahead = barmerge.lookahead_on)
+[v3G1H, v3G1L, v3G1T, v3G1End, v3G1H2, v3G1L2, v3G1O, v3G1C, v3G1C1, v3G1H1, v3G1L1, v3G1Cutoff, v3G1Seq, v3G1Prior] = request.security(syminfo.tickerid, tf1Input, f_v3GapPacket(v3GapAgeInput), lookahead = barmerge.lookahead_on)
+[v3G2H, v3G2L, v3G2T, v3G2End, v3G2H2, v3G2L2, v3G2O, v3G2C, v3G2C1, v3G2H1, v3G2L1, v3G2Cutoff, v3G2Seq, v3G2Prior] = request.security(syminfo.tickerid, tf2Input, f_v3GapPacket(v3GapAgeInput), lookahead = barmerge.lookahead_on)
+int evT = newTf1Bar ? f_v3TsmEvent(tf1Input, tf1C, true) : 0
+actSide = ev3 != 0 ? ev3 : ev2 != 0 ? ev2 : ev1 != 0 ? ev1 : evT
+actAnchor = ev3 != 0 or ev2 != 0 or ev1 != 0
+if actSide != 0
+    if trendDir == actSide
+        lastBosAt := time
+        trendPendSide := 0
+    else if actAnchor
+        trendDir := actSide
+        trendSince := time
+        trendPendSide := 0
+    else if trendDir == 0
+        trendDir := actSide
+        trendSince := time
+    else
+        anchorHoldsOld = false
+        for slotT = 0 to 2
+            if array.get(v3ExtraOn, slotT)
+                for lvlT in v3ExtraDols
+                    if lvlT.tf == array.get(v3ExtraTf, slotT) and lvlT.dolRole == "PDOL" and lvlT.dolState == 0 and lvlT.dolCoverage and lvlT.isHighLow == (trendDir == 1 ? "High" : "Low")
+                        anchorHoldsOld := true
+        if anchorHoldsOld
+            trendPendSide := actSide
+            trendPendAt := time
+        else
+            trendDir := actSide
+            trendSince := time
+            trendPendSide := 0
 if v3NativeEnabled and newTf1Bar
-    // V3.1 zombie guard (RESTORED — this line was lost in transcription and its absence let a
+    // V3.1 zombie guard (RESTORED - this line was lost in transcription and its absence let a
     // 2007 episode reach 282 candles and freeze all detection): a pending episode whose candle
     // count exceeds the TF1 main lookback retires before any new sweep is evaluated, so a stale
     // episode can never block future episodes. Bounded, owner-tunable via Lookback.
@@ -2181,7 +2253,7 @@ if v3NativeEnabled and newTf1Bar
         priorLive = (not na(v3Owner) and na(v3Owner.endTime)) ? v3Owner : na
         priorLiveClean = not na(priorLive) ? f_v3OwnerClean(priorLive) : false
         priorLiveDir = not na(priorLive) ? priorLive.direction : 0
-        prioDir = f_v3PriorityDir((episode.h + episode.l) / 2.0)
+        prioDir = f_v3PriorityDir(episode.sweptLow ? episode.l : episode.sweptHigh ? episode.h : (episode.h + episode.l) / 2.0, episode.origin)
         firstDir = prioDir != 0 ? prioDir : 1
         for cand = 0 to 1
             direction = cand == 0 ? firstDir : -firstDir
@@ -2200,10 +2272,18 @@ if v3NativeEnabled and newTf1Bar
 
                 // V3.1.1 PDOL Direction Gate (Owner Rule): Setup must align with the most recent undisturbed TF1 PDOL.
                 // If the engine found a clear directional preference (prioDir != 0) and this setup opposes it, kill it.
-                if actionable and prioDir != 0 and prioDir != direction
+                if actionable and trendDir != 0 and trendDir != direction
+                    actionable := false
+                    contextReason := "opposes trend (trend " + str.tostring(trendDir) + " vs dir " + str.tostring(direction) + ")"
+                if actionable and trendDir == 0 and prioDir != 0 and prioDir != direction
                     actionable := false
                     contextReason := "opposes TF1 draw (prio " + str.tostring(prioDir) + " vs dir " + str.tostring(direction) + ")"
-                [poiHit, poiDiag] = f_v3PoiGate(direction, direction == 1 ? episode.l : episode.h, episode.origin, episode.boundary, episode.rangeLow, episode.rangeHigh)
+                
+                // Lever 3 (F-strict): Operative rejection slice.
+                // Long: [episode.l, min(O,C)]. Short: [max(O,C), episode.h].
+                sliceLo = direction == 1 ? episode.l : math.max(episode.o, episode.c)
+                sliceHi = direction == 1 ? math.min(episode.o, episode.c) : episode.h
+                [poiHit, poiDiag] = f_v3PoiGate(direction, episode.origin, episode.boundary, sliceLo, sliceHi)
                 if actionable and not poiHit
                     actionable := false
                     contextReason := "no POI souped: " + poiDiag
@@ -2238,6 +2318,9 @@ if v3NativeEnabled and newTf1Bar
                 setup.confluenceLayers := confLayers
                 setup.intactPrimary := intact
                 setup.contextReason := contextReason
+                setup.poiDiag := poiDiag
+                if trendPendSide != 0 and trendPendSide == direction
+                    setup.caution := true
                 f_v3TsExport(setup)
                 if actionable
                     // D-33: no supersession; owner tracks the most recent actionable setup only.
@@ -2306,6 +2389,7 @@ if v3NativeEnabled
             gh2 = pass == 0 ? v3G1H2 : v3G2H2
             gl2 = pass == 0 ? v3G1L2 : v3G2L2
             go = pass == 0 ? v3G1O : v3G2O
+            gc = pass == 0 ? v3G1C : v3G2C  // NEW: Native close price
             gc1 = pass == 0 ? v3G1C1 : v3G2C1
             gh1 = pass == 0 ? v3G1H1 : v3G2H1
             gl1 = pass == 0 ? v3G1L1 : v3G2L1
@@ -2314,7 +2398,8 @@ if v3NativeEnabled
             // Own-timeframe complete OHLC fills an already-available zone at native close.
             for gap in v3Gaps
                 if gap.active and f_v3TfKey(gap.nativeTf) == f_v3TfKey(nativeTf) and gap.availableAt <= gt
-                    filled = gap.direction == 1 ? gl <= gap.lower : gh >= gap.upper
+                    // PAINT ON THE WALL: Only a CLOSE through the gap invalidates it.
+                    filled = gap.direction == 1 ? gc <= gap.lower : gc >= gap.upper
                     if filled
                         gap.active := false
                         gap.endedAt := ge
@@ -2340,6 +2425,7 @@ if v3NativeEnabled
             f_v3DeleteGap(gap)
             array.remove(v3Gaps, idxGap)
         idxGap -= 1
+    
 
 // =============================================================================================
 // SECTION 20B -- ORDER BLOCK RESEARCH FRAMEWORK (P-2 scaffold: draw-only, never gates)
@@ -2705,6 +2791,7 @@ f_v3LastGatedIdx() =>
             idx := j
         j -= 1
     idx
+v3PanelOffsetInput = input.int(0, "Panel record offset (0 = ratified view; N = Nth-newest retained record)", minval = 0, maxval = 60, group = "V3 Setup Engine", tooltip = "Display-only diagnostic: pages rows 4-7 backwards through retained setup records so any record's reason and witness are readable. Touches no model math.")
 var table v3StatusTable = table.new(position.bottom_right, 1, 9)
 if barstate.islast
     table.clear(v3StatusTable, 0, 0, 0, 8)
@@ -2750,7 +2837,7 @@ if barstate.islast
     for sb in sessBox
         if not na(sb)
             sessBoxes += 1
-    statusD = "Sess gate " + (sessionsTimeframeOk ? "ON" : "OFF") + " A:" + (effectiveShowSessionA ? (sessionAActive ? "act" : "idle") : "dis") + " B:" + (effectiveShowSessionB ? (sessionBActive ? "act" : "idle") : "dis") + " C:" + (effectiveShowSessionC ? (sessionCActive ? "act" : "idle") : "dis") + " D:" + (effectiveShowSessionD ? (sessionDActive ? "act" : "idle") : "dis") + " R:" + (sessionARangeInput ? "1" : "0") + (sessionBRangeInput ? "1" : "0") + (sessionCRangeInput ? "1" : "0") + (sessionDRangeInput ? "1" : "0") + " M:" + (sessionAMaxMinInput ? "1" : "0") + (sessionBMaxMinInput ? "1" : "0") + (sessionCMaxMinInput ? "1" : "0") + (sessionDMaxMinInput ? "1" : "0") + " open " + str.tostring(sessBoxes) + " fin " + str.tostring(array.size(finishedBoxes))
+    statusD = "Sess gate " + (sessionsTimeframeOk ? "ON" : "OFF") + " A:" + (effectiveShowSessionA ? (sessionAActive ? "act" : "idle") : "dis") + " B:" + (effectiveShowSessionB ? (sessionBActive ? "act" : "idle") : "dis") + " C:" + (effectiveShowSessionC ? (sessionCActive ? "act" : "idle") : "dis") + " D:" + (effectiveShowSessionD ? (sessionDActive ? "act" : "idle") : "dis") + " R:" + (sessionARangeInput ? "1" : "0") + (sessionBRangeInput ? "1" : "0") + (sessionCRangeInput ? "1" : "0") + (sessionDRangeInput ? "1" : "0") + " M:" + (sessionAMaxMinInput ? "1" : "0") + (sessionBMaxMinInput ? "1" : "0") + (sessionCMaxMinInput ? "1" : "0") + (sessionDMaxMinInput ? "1" : "0") + " open " + str.tostring(sessBoxes) + " fin " + str.tostring(array.size(finishedBoxes)) + " | trend " + (trendDir == 0 ? "undef" : trendDir == 1 ? "bull" : "bear") + (trendPendSide != 0 ? " pend " + str.tostring(trendPendSide) : "") + (not na(lastBosAt) ? " bos " + str.format_time(lastBosAt, "dd/MM", "UTC") : "")
     table.cell(v3StatusTable, 0, 0, statusA, text_color = color.orange, text_size = size.tiny, bgcolor = color.new(color.black, statusA == "" ? 100 : 90), tooltip = "Row 1: warnings - chart ordering, skipped anchors, drawing pressure, alert drops.")
     table.cell(v3StatusTable, 0, 1, statusB, text_color = color.orange, text_size = size.tiny, bgcolor = color.new(color.black, 90), tooltip = "Row 2: engine census and pending episode close references.")
     table.cell(v3StatusTable, 0, 2, statusC, text_color = color.orange, text_size = size.tiny, bgcolor = color.new(color.black, 90), tooltip = "Row 3: POI census and object budget.")
@@ -2758,14 +2845,15 @@ if barstate.islast
     // and audit note live in this panel instead of on the chart.
     if v3DetailPanelInput and v3NativeEnabled and array.size(v3Setups) > 0
         showIdx = f_v3LastGatedIdx()
-        showFallback = showIdx < 0
-        newest = showIdx >= 0 ? array.get(v3Setups, showIdx) : array.get(v3Setups, array.size(v3Setups) - 1)
+        showFallback = showIdx < 0 and v3PanelOffsetInput == 0
+        viewIdx = v3PanelOffsetInput == 0 ? (showIdx >= 0 ? showIdx : array.size(v3Setups) - 1) : math.max(array.size(v3Setups) - v3PanelOffsetInput, 0)
+        newest = array.get(v3Setups, viewIdx)
         detailInk = newest.direction == 1 ? v3BullColorInput : v3BearColorInput
         table.cell(v3StatusTable, 0, 3, statusD, text_color = color.orange, text_size = size.tiny, bgcolor = color.new(color.black, 90), tooltip = "Row 4: sessions gate, per-session enable/active, Range and MaxMin toggles, open/finished box counts.")
-        table.cell(v3StatusTable, 0, 4, (showFallback ? "NO GATED IN MEMORY: TS " : "TS ") + newest.variant + (newest.direction == 1 ? " LONG" : " SHORT") + (newest.actionable ? " " + (newest.setupClass == "" ? "B" : newest.setupClass) + " -> " + f_v3TfName(newest.targetTf) : " CONTEXT" + (newest.setupClass != "" ? " (" + newest.setupClass + ")" : "")), text_color = detailInk, text_size = size.tiny, bgcolor = color.new(color.black, 85))
+        table.cell(v3StatusTable, 0, 4, (v3PanelOffsetInput > 0 ? "VIEW -" + str.tostring(v3PanelOffsetInput) + ": TS " : (showFallback ? "NO GATED IN MEMORY: TS " : "TS ")) + newest.variant + (newest.direction == 1 ? " LONG" : " SHORT") + (newest.actionable ? " " + (newest.setupClass == "" ? "B" : newest.setupClass) + " -> " + f_v3TfName(newest.targetTf) : " CONTEXT" + (newest.setupClass != "" ? " (" + newest.setupClass + ")" : "")), text_color = detailInk, text_size = size.tiny, bgcolor = color.new(color.black, 85))
         table.cell(v3StatusTable, 0, 5, (newest.actionable ? "grade " + newest.grade + " score " + str.tostring(newest.score, "#.##") : "ungraded") + " | conf x" + str.tostring(newest.confluenceLayers) + " intact " + (newest.intactPrimary ? "Y" : "N") + " break " + newest.breakClass + (newest.opposition ? " OPP" : ""), text_color = color.new(color.black, 20), text_size = size.tiny, bgcolor = color.new(color.black, 90))
         table.cell(v3StatusTable, 0, 6, "win " + str.tostring(newest.rangeLow, format.mintick) + "-" + str.tostring(newest.rangeHigh, format.mintick) + " sweep " + str.format_time(newest.origin, "dd/MM/yy", "UTC") + " close " + str.tostring(newest.manClose, format.mintick), text_color = color.new(color.black, 20), text_size = size.tiny, bgcolor = color.new(color.black, 90))
-        table.cell(v3StatusTable, 0, 7, newest.actionable ? "target " + str.tostring(newest.target, format.mintick) + " " + f_v3TfName(newest.targetTf) + " entry " + str.tostring(newest.entry, format.mintick) : "reason: " + newest.contextReason, text_color = color.new(color.black, 20), text_size = size.tiny, bgcolor = color.new(color.black, 90))
+        table.cell(v3StatusTable, 0, 7, (newest.actionable ? "target " + str.tostring(newest.target, format.mintick) + " " + f_v3TfName(newest.targetTf) + " entry " + str.tostring(newest.entry, format.mintick) + " | poi " + newest.poiDiag : "reason: " + newest.contextReason), text_color = color.new(color.black, 20), text_size = size.tiny, bgcolor = color.new(color.black, 90))
         table.cell(v3StatusTable, 0, 8, v3AuditInput and not na(v3Manipulation) ? "pending sweep " + str.format_time(v3Manipulation.origin, "dd/MM/yy", "UTC") + " candles " + str.tostring(v3Manipulation.candles) + " close " + str.tostring(v3Manipulation.c, format.mintick) : "window " + v3RangeState + " " + str.tostring(v3RangeLow, format.mintick) + "-" + str.tostring(v3RangeHigh, format.mintick), text_color = color.new(color.black, 35), text_size = size.tiny, bgcolor = color.new(color.black, 90))
 // =============================================================================================
 // SECTION 24 -- EA-FACING EVENT TRANSPORT

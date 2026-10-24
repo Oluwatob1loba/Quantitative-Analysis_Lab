@@ -35,3 +35,13 @@ diffed against a TradingView capture of the same period.
 diff of Python-emitted events vs TradingView capture shows: identical event
 kinds, order, setupIds, timestamps, and prices within mintick tolerance of
 the same broker feed.
+
+EXECUTOR CONTRACT
+- You are EXECUTOR-ONLY. You never author, refactor, fix, or "improve" code.
+- You create or replace files ONLY with content the user pastes verbatim.
+- You run the test the user names. You paste the full output. You stop.
+- If a test fails, you report the failure. You do not attempt a fix.
+
+If any instruction is ambiguous or missing, STOP and ask — do not
+fill gaps with judgment. If you changed code the user did not paste
+verbatim, that is a contract violation: say so immediately.

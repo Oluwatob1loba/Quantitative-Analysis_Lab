@@ -53,6 +53,7 @@ class DolEngine:
         self.first_observed: Optional[pd.Timestamp] = None
         self.max_pool = 0
         self._tf1eng = None
+        self._tf1_origins = []
 
     # ---------------------------------------------------------------- helpers
     def _emit(self, rec: DolRecord, origin, detected):
@@ -120,29 +121,32 @@ class DolEngine:
 
     def _on_tf1(self, t, row, tf1eng):
         c, h, l = row["tf1_close"], row["tf1_high"], row["tf1_low"]
-        origin = row["tf1_bucket"]
-        # roles for the two levels stamped from this confirmed candle
+        origin = row["tf1_cbucket"]
+        # Temporal retention view (BUG-PY-03): cutoff as of THIS roll, from origins seen
+        # so far — mirrors Pine's array.remove at eviction (C:L568..L603) without reading
+        # the TF1 engine's final state, which would leak future knowledge (DR-02).
+        self._tf1_origins.append(origin)
+        lb = self.cfg.tf1_lookback
+        cutoff = self._tf1_origins[-lb] if len(self._tf1_origins) >= lb else None
+        if cutoff is not None:
+            for key in [k for k, r in self.records.items()
+                        if r.tf_key == tf_key(self.cfg.tf1) and r.owner.origin < cutoff]:
+                del self.records[key]
+        # Roles for the two levels stamped from this confirmed candle (P4.3).
         direction = "up" if c > row["tf1_open"] else "down" if c < row["tf1_open"] else "neutral"
         for lv in tf1eng.levels:
             if lv.origin == origin and lv.kind in ("High", "Low"):
                 role = "" if direction == "neutral" else (
                     "PDOL" if (direction == "up") == (lv.kind == "High") else "SDOL")
                 self.records[(tf_key(self.cfg.tf1), str(origin), lv.kind)] = DolRecord(
-                    owner=lv, tf_key=tf_key(self.cfg.tf1), role=role,
-                    coverage=True)
-        # Retention sync (BUG-PY-02 / D-PY-16): the confluence pool must mirror CORE's
-        # pruned arrays, not all history. Drop records whose TF1 level left tf1eng.levels.
-        alive = {id(lv) for lv in tf1eng.levels}
-        for key in [k for k, r in self.records.items()
-                    if r.tf_key == tf_key(self.cfg.tf1) and id(r.owner) not in alive]:
-            del self.records[key]
-        # consumption (strict close beyond polarity), then sweep (wick equality-or-better)
+                    owner=lv, tf_key=tf_key(self.cfg.tf1), role=role, coverage=True)
+        # Consumption then sweep, per-roll packet only (C:L519..L531, C:L1673..L1683).
+        # NO is_active guard: the close that invalidates is the close that consumes, and
+        # is_active is a final-state flag that would leak end-of-history knowledge here.
         for key, rec in list(self.records.items()):
             if rec.tf_key != tf_key(self.cfg.tf1) or rec.state >= 2 or rec.role == "":
                 continue
             lv = rec.owner
-            if not lv.is_active:
-                continue
             broke = (lv.kind == "High" and c > lv.price) or (lv.kind == "Low" and c < lv.price)
             if broke:
                 rec.state, rec.changed_at = 2, t
@@ -157,7 +161,7 @@ class DolEngine:
 
     def _on_anchor(self, t, row, a, p):
         c, h, l = row[f"{p}_close"], row[f"{p}_high"], row[f"{p}_low"]
-        origin = row[f"{p}_bucket"]
+        origin = row[f"{p}_cbucket"]
         key = tf_key(a.tf)
         for d in self.anchors:
             if d.tf_key != key or not d.active:
@@ -173,7 +177,7 @@ class DolEngine:
                 d.active, d.end_time = False, origin
                 rec.state, rec.changed_at = 2, t
                 self._emit(rec, origin, t)
-            elif rec.state == 0 and origin > d.available_at:
+            elif rec.state == 0 and origin >= d.available_at:
                 touched = (d.side == "High" and h >= d.price) or (d.side == "Low" and l <= d.price)
                 if touched:
                     rec.state, rec.changed_at = 1, t
