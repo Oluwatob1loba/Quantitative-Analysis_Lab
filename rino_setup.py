@@ -89,7 +89,9 @@ def poi_gate(gaps, direction, origin, boundary, slice_lo, slice_hi, pending, tf1
             fillok += 1
         if g.available_at <= boundary:
             tim += 1
-            if g.native_tf == k1 and tf1_fvg_on:
+            # D-610 (L1, ratified V3.2-TSM-L1-O9): pre-origin close-through VETOES authorization.
+            # Only fills caused by the soup's own path (ended_at >= origin) or live gaps count.
+            if g.native_tf == k1 and tf1_fvg_on and (g.ended_at is None or g.ended_at >= origin):
                 lay += 1; hit = True
                 if not witness:
                     witness = f"{g.native_tf} {str(g.origin)[:10]} {g.lower}-{g.upper}" + \
@@ -100,7 +102,7 @@ def poi_gate(gaps, direction, origin, boundary, slice_lo, slice_hi, pending, tf1
             if tf1_fvg_on:
                 hit = True
     diag = (f"scanned {scanned} dir {dirm} pen {pen} fill {fillok} time {tim} "
-            f"layer {lay} pend {len(pending)}" + (f" via {witness}" if witness else ""))
+            f"auth {lay} pend {len(pending)}" + (f" via {witness}" if witness else ""))
     return hit, diag
 
 
@@ -132,8 +134,10 @@ def pick_target(cfg, direction, entry, manipulation_start, tf1_records, anchor_r
             continue
         if is_anchor:
             raw = r.tf_key
-            pri = 0 if raw == tf_key_(cfg.anchors[0].tf) else 1 if len(cfg.anchors) > 1 and raw == tf_key_(cfg.anchors[1].tf) else \
-                  2 if len(cfg.anchors) > 2 and raw == tf_key_(cfg.anchors[2].tf) else 4
+            # S-6 (ratified): HIGHEST anchor authority first — A3 slot 0, A2 slot 1, A1 slot 2.
+            pri = 0 if len(cfg.anchors) > 2 and raw == tf_key_(cfg.anchors[2].tf) else \
+                  1 if len(cfg.anchors) > 1 and raw == tf_key_(cfg.anchors[1].tf) else \
+                  2 if raw == tf_key_(cfg.anchors[0].tf) else 4
         else:
             pri = 3
         d = abs(price - entry)
@@ -222,9 +226,10 @@ def grade(setup, cfg):
     (V3.2 Fix B); ADD-01 keyTimeSweep weight (D-PY-06 research amendment)."""
     if not setup["actionable"]:
         return None, None
-    bonus = 4.0 if setup["targetTf"] == (tf_key_(cfg.anchors[0].tf) if cfg.anchors else "") else \
+    # S-7 (ratified): 4/3/2 = Anchor3/Anchor2/Anchor1 — highest authority earns the most.
+    bonus = 4.0 if len(cfg.anchors) > 2 and setup["targetTf"] == tf_key_(cfg.anchors[2].tf) else \
             3.0 if len(cfg.anchors) > 1 and setup["targetTf"] == tf_key_(cfg.anchors[1].tf) else \
-            2.0 if len(cfg.anchors) > 2 and setup["targetTf"] == tf_key_(cfg.anchors[2].tf) else 1.0
+            2.0 if cfg.anchors and setup["targetTf"] == tf_key_(cfg.anchors[0].tf) else 1.0
     score = (setup["confluenceLayers"] * cfg.w_dol_confluence
              + (cfg.w_htf_alignment if setup["aligned"] else 0)
              + (cfg.w_fvg_vi if (setup["fvg"] or setup["vi"]) else 0)
@@ -390,7 +395,7 @@ class SetupEngine:
                                                 "grade": g, "score": sc, "detectedAt": t})
 
     # -- TF1 roll (post-touch): owner monitor + construction ----------------
-    def on_tf1_after(self, t, row, comps, dol, prio_dir, key_time_raid):
+    def on_tf1_after(self, t, row, comps, dol, prio_dir, key_time_raid, layers=None):
         c, h, l = row["tf1_close"], row["tf1_high"], row["tf1_low"]
         origin = row["tf1_cbucket"]
         # owner monitor (failure precedence, dualHit, D-PY-04 guard)
@@ -413,9 +418,14 @@ class SetupEngine:
         prior_dir = prior_live["direction"] if prior_live else 0
         tf1_recs = self._tf1_records(dol)
         anc_recs = self._anchor_records(dol)
+        from rino_episode import priority_direction as _pd
+        _pl = layers          # loop-invariant: 'layers' is shadowed by the confluence count below
         for comp in comps:
             ep = comp.episode
             direction = comp.direction
+            # D-506: prioDir reference = raid extreme (per completion, not roll midpoint)
+            ref = ep.l if ep.swept_low else ep.h if ep.swept_high else (ep.h + ep.l) / 2.0
+            prio = _pd(ref, _pl, self.k1) if _pl is not None else (prio_dir or 0)
             zone_lo = ep.l if direction == 1 else max(ep.o, ep.c)
             zone_hi = min(ep.o, ep.c) if direction == 1 else ep.h
             entry = (zone_lo + zone_hi) / 2.0
@@ -429,8 +439,8 @@ class SetupEngine:
             # TSM direction gates (live pine)
             if actionable and self.tsm.dir != 0 and self.tsm.dir != direction:
                 actionable = False; reason = f"opposes trend (trend {self.tsm.dir} vs dir {direction})"
-            if actionable and self.tsm.dir == 0 and prio_dir != 0 and prio_dir != direction:
-                actionable = False; reason = f"opposes TF1 draw (prio {prio_dir} vs dir {direction})"
+            if actionable and self.tsm.dir == 0 and prio != 0 and prio != direction:
+                actionable = False; reason = f"opposes TF1 draw (prio {prio} vs dir {direction})"
             slice_lo = ep.l if direction == 1 else max(ep.o, ep.c)
             slice_hi = min(ep.o, ep.c) if direction == 1 else ep.h
             pend = [(g.direction, g.lower, g.upper, g.available_at) for g in self.feed.candidates_today()]
@@ -517,9 +527,11 @@ class SetupEngine:
         # TSM update from this TF1 roll's own event
         ev_t = self.tsm.event(tf1_recs, self.k1, c)
         act_anchor_side = 0
-        for key, side in self.anchor_ev.items():
+        for a in reversed(self.cfg.anchors):        # TSM-1: highest authority first A3->A2->A1
+            side = self.anchor_ev.get(tf_key_(a.tf), 0)
             if side != 0:
                 act_anchor_side = side
+                break
         act_side = act_anchor_side if act_anchor_side != 0 else ev_t
         self.tsm.update(act_side, act_anchor_side != 0, anc_recs,
                         [a.enabled for a in self.cfg.anchors])

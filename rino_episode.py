@@ -251,7 +251,10 @@ class EpisodeMachine:
         if not (long_ready or short_ready):
             return []
 
-        prio = priority_direction((ep.h + ep.l) / 2.0, priority_layers, tf1_key)
+        # D-506 (ratified): reference = raid extreme — sweptLow -> episode.l, sweptHigh -> h,
+        # else midpoint. NOT the plain midpoint.
+        ref = ep.l if ep.swept_low else ep.h if ep.swept_high else (ep.h + ep.l) / 2.0
+        prio = priority_direction(ref, priority_layers, tf1_key)
         first = prio if prio != 0 else 1
         variant = "Window" if ep.candles == 1 else "WindowMulti"
         completions = []

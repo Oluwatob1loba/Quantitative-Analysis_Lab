@@ -34,7 +34,10 @@ hit, diag = poi_gate(gaps, 1, T1, T2, 1.1005, 1.1007, [], True, "1D")
 check("G1a slice penetration hits", hit, diag)
 filled = [Gap("FVG", "1D", 1, 1.1000, 1.1010, T0, T0, T0, active=False, ended_at=T1 - 5)]
 hit2, diag2 = poi_gate(filled, 1, T1, T2, 1.1005, 1.1007, [], True, "1D")
-check("G1b pre-filled gap still hits (executed code; comment says no)", hit2, diag2)
+check("G1b pre-origin fill VETOES (D-610 L1 ratified)", not hit2, diag2)
+episode_fill = [Gap("FVG", "1D", 1, 1.1000, 1.1010, T0, T0, T0, active=False, ended_at=T1 + 5)]
+hit2c, _ = poi_gate(episode_fill, 1, T1, T2, 1.1005, 1.1007, [], True, "1D")
+check("G1c episode-caused fill still authorizes", hit2c, "")
 
 # G2: targets — slot priority + nearest; DOC-08 raw-TF anchorBonus in grade
 recs_tf1 = [rec(1.1100, "High"), rec(1.1200, "High"), rec(1.0900, "Low", role="SDOL")]
@@ -47,14 +50,14 @@ s = {"actionable": True, "targetTf": "1W", "confluenceLayers": 1, "aligned": Tru
      "breakClass": "Critical", "setupClass": "A", "keyTimeSweep": False}
 g, sc = grade(s, cfg)
 # 1*1 + 1 + 1 + 2 + 1 + 4*1 = 10 -> A (unclamped, class A)
-check("G2c grade math with anchorBonus 4", g == "A" and sc == 10, (g, sc))
+check("G2c grade math, A1 bonus now 2 (S-7)", g == "A" and sc == 8, (g, sc))
 s2 = dict(s, setupClass="B", confluenceLayers=0, aligned=False, fvg=False, breakClass="None",
           targetTf="1D")
 g2, sc2 = grade(s2, cfg)
 check("G2d class B capped at B", g2 == "B", (g2, sc2))
 s3 = dict(s, keyTimeSweep=True, confluenceLayers=0, aligned=False, fvg=False, breakClass="None")
 g3, sc3 = grade(s3, cfg)
-check("G2e ADD-01 keyTimeSweep weight adds 1", sc3 == 6, (g3, sc3))  # intact 1 + bonus 4 + keyTime 1
+check("G2e ADD-01 keyTimeSweep weight adds 1", sc3 == 4, (g3, sc3))  # intact 1 + bonus 2 (S-7) + keyTime 1
 
 # G3: class + t1
 check("G3a opposing close = A", setup_class(1.10, 1.11, 1.11, 1.10) == "A")

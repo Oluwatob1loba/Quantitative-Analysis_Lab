@@ -1868,7 +1868,7 @@ f_v3PoiGate(int direction, int originTime, int boundaryTime, float sliceLo, floa
                     if gap.availableAt <= boundaryTime
                         timingOk += 1
                     keyKey = f_v3TfKey(gap.nativeTf)
-                    if keyKey == f_v3TfKey(tf1Input) and v3Tf1FvgInput
+                    if keyKey == f_v3TfKey(tf1Input) and v3Tf1FvgInput and (na(gap.endedAt) or gap.endedAt >= originTime)
                         layerOn += 1
                         hit := true
                         if witness == ""
@@ -1880,7 +1880,7 @@ f_v3PoiGate(int direction, int originTime, int boundaryTime, float sliceLo, floa
                 pendKey = f_v3TfKey(cand.nativeTf)
                 if pendKey == f_v3TfKey(tf1Input) and v3Tf1FvgInput
                     hit := true
-    [hit, "scanned " + str.tostring(scanned) + " dir " + str.tostring(dirMatch) + " pen " + str.tostring(penMatch) + " fill " + str.tostring(fillOk) + " time " + str.tostring(timingOk) + " layer " + str.tostring(layerOn) + " pend " + str.tostring(array.size(v3PoiPending)) + " via " + witness]
+    [hit, "scanned " + str.tostring(scanned) + " dir " + str.tostring(dirMatch) + " pen " + str.tostring(penMatch) + " fill " + str.tostring(fillOk) + " time " + str.tostring(timingOk) + " auth " + str.tostring(layerOn) + " pend " + str.tostring(array.size(v3PoiPending)) + " via " + witness]
 // Setup class (M-1): A when the confirming candle's own PDOL matches an undisturbed covered PDOL
 // of any priority layer within that layer's last completed candles; B otherwise. Completed-only:
 // the forming candle never carries information (owner rule).
@@ -1901,14 +1901,15 @@ f_v3SetupClass(float manOpen, float manClose, float manHigh, float manLow, float
 f_v3PriorityDir(float referenceValue, int originTime) =>
     int prio = 0
     for layerIdx = 0 to 3
-        layerTf = layerIdx == 0 ? v3Dol1Tf : layerIdx == 1 ? v3Dol2Tf : layerIdx == 2 ? v3Dol3Tf : tf1Input
-        layerOn = layerIdx == 0 ? v3Dol1On : layerIdx == 1 ? v3Dol2On : layerIdx == 2 ? v3Dol3On : true
-        if prio == 0 and layerOn and (layerIdx == 3 or f_v3TfKey(layerTf) != f_v3TfKey(tf1Input))
-            src = layerIdx == 3 ? tf1Levels : v3ExtraDols
+        slot = 3 - layerIdx
+        layerTf = slot == 0 ? v3Dol1Tf : slot == 1 ? v3Dol2Tf : slot == 2 ? v3Dol3Tf : tf1Input
+        layerOn = slot == 0 ? v3Dol1On : slot == 1 ? v3Dol2On : slot == 2 ? v3Dol3On : true
+        if prio == 0 and layerOn and (slot == 3 or f_v3TfKey(layerTf) != f_v3TfKey(tf1Input))
+            src = slot == 3 ? tf1Levels : v3ExtraDols
             float nearHigh = na
             float nearLow = na
             for lvlP in src
-                if (layerIdx == 3 or lvlP.tf == layerTf) and lvlP.dolRole == "PDOL" and lvlP.dolCoverage and (lvlP.dolState == 0 or (not na(lvlP.dolChangedAt) and lvlP.dolChangedAt >= originTime))
+                if (slot == 3 or lvlP.tf == layerTf) and lvlP.dolRole == "PDOL" and lvlP.dolCoverage and (lvlP.dolState == 0 or (not na(lvlP.dolChangedAt) and lvlP.dolChangedAt >= originTime))
                     if lvlP.isHighLow == "High"
                         nearHigh := na(nearHigh) ? lvlP.price : math.min(nearHigh, lvlP.price)
                     else
@@ -1980,7 +1981,7 @@ f_v3Transition(V3Setup setup, string nextState, int stamp) =>
     true
 f_v3Grade(V3Setup setup, int stamp) =>
     if setup.actionable
-        anchorBonus = setup.targetTf == v3Dol1Tf ? 4.0 : setup.targetTf == v3Dol2Tf ? 3.0 : setup.targetTf == v3Dol3Tf ? 2.0 : 1.0
+        anchorBonus = setup.targetTf == v3Dol3Tf ? 4.0 : setup.targetTf == v3Dol2Tf ? 3.0 : setup.targetTf == v3Dol1Tf ? 2.0 : 1.0
         float score = setup.confluenceLayers * v3WConfluence + (setup.aligned ? v3WHtf : 0) + (setup.fvg or setup.vi ? v3WKey : 0) + (setup.sessionTag or setup.tsTiming or setup.crtTiming ? v3WTiming : 0)
         score += setup.breakClass == "Critical" ? v3WCritical : setup.breakClass == "Major" ? v3WMajor : setup.breakClass == "Minor" ? v3WMinor : 0
         score += setup.opposition ? v3WOpposition : 0
@@ -2033,6 +2034,7 @@ var int v3FirstObserved = time
 var int trendDir = 0
 var int trendSince = na
 var int lastBosAt = na
+var string lastBosLayer = ""
 var int trendPendSide = 0
 var int trendPendAt = na
 f_v3TsmEvent(string layerTf, float cc, bool isTf1) =>
@@ -2147,6 +2149,7 @@ actAnchor = ev3 != 0 or ev2 != 0 or ev1 != 0
 if actSide != 0
     if trendDir == actSide
         lastBosAt := time
+        lastBosLayer := ev3 != 0 ? "A3" : ev2 != 0 ? "A2" : ev1 != 0 ? "A1" : "TF1"
         trendPendSide := 0
     else if actAnchor
         trendDir := actSide
@@ -2837,7 +2840,7 @@ if barstate.islast
     for sb in sessBox
         if not na(sb)
             sessBoxes += 1
-    statusD = "Sess gate " + (sessionsTimeframeOk ? "ON" : "OFF") + " A:" + (effectiveShowSessionA ? (sessionAActive ? "act" : "idle") : "dis") + " B:" + (effectiveShowSessionB ? (sessionBActive ? "act" : "idle") : "dis") + " C:" + (effectiveShowSessionC ? (sessionCActive ? "act" : "idle") : "dis") + " D:" + (effectiveShowSessionD ? (sessionDActive ? "act" : "idle") : "dis") + " R:" + (sessionARangeInput ? "1" : "0") + (sessionBRangeInput ? "1" : "0") + (sessionCRangeInput ? "1" : "0") + (sessionDRangeInput ? "1" : "0") + " M:" + (sessionAMaxMinInput ? "1" : "0") + (sessionBMaxMinInput ? "1" : "0") + (sessionCMaxMinInput ? "1" : "0") + (sessionDMaxMinInput ? "1" : "0") + " open " + str.tostring(sessBoxes) + " fin " + str.tostring(array.size(finishedBoxes)) + " | trend " + (trendDir == 0 ? "undef" : trendDir == 1 ? "bull" : "bear") + (trendPendSide != 0 ? " pend " + str.tostring(trendPendSide) : "") + (not na(lastBosAt) ? " bos " + str.format_time(lastBosAt, "dd/MM", "UTC") : "")
+    statusD = "Sess gate " + (sessionsTimeframeOk ? "ON" : "OFF") + " A:" + (effectiveShowSessionA ? (sessionAActive ? "act" : "idle") : "dis") + " B:" + (effectiveShowSessionB ? (sessionBActive ? "act" : "idle") : "dis") + " C:" + (effectiveShowSessionC ? (sessionCActive ? "act" : "idle") : "dis") + " D:" + (effectiveShowSessionD ? (sessionDActive ? "act" : "idle") : "dis") + " R:" + (sessionARangeInput ? "1" : "0") + (sessionBRangeInput ? "1" : "0") + (sessionCRangeInput ? "1" : "0") + (sessionDRangeInput ? "1" : "0") + " M:" + (sessionAMaxMinInput ? "1" : "0") + (sessionBMaxMinInput ? "1" : "0") + (sessionCMaxMinInput ? "1" : "0") + (sessionDMaxMinInput ? "1" : "0") + " open " + str.tostring(sessBoxes) + " fin " + str.tostring(array.size(finishedBoxes)) + " | trend " + (trendDir == 0 ? "undef" : trendDir == 1 ? "bull" : "bear") + (trendPendSide != 0 ? " pend " + str.tostring(trendPendSide) : "") + (not na(lastBosAt) ? " bos " + lastBosLayer + " " + str.format_time(lastBosAt, "dd/MM", "UTC") : "")
     table.cell(v3StatusTable, 0, 0, statusA, text_color = color.orange, text_size = size.tiny, bgcolor = color.new(color.black, statusA == "" ? 100 : 90), tooltip = "Row 1: warnings - chart ordering, skipped anchors, drawing pressure, alert drops.")
     table.cell(v3StatusTable, 0, 1, statusB, text_color = color.orange, text_size = size.tiny, bgcolor = color.new(color.black, 90), tooltip = "Row 2: engine census and pending episode close references.")
     table.cell(v3StatusTable, 0, 2, statusC, text_color = color.orange, text_size = size.tiny, bgcolor = color.new(color.black, 90), tooltip = "Row 3: POI census and object budget.")

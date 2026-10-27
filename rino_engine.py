@@ -104,7 +104,7 @@ class RinoEngine:
                      if r.tf_key == k1 and r.role != ""
                      and r.state in (0, 1) and r.coverage]
         layers = self._priority_layers(origin)
-        self._prio_dir = priority_direction((candle.h + candle.l) / 2.0, layers, k1)
+        self._layers = layers
         for comp in self.ep.process_roll(candle, window_origin, sweepable,
                                          layers, tf1_key=k1, admit_dirs=admit):
             self.completions.append(self._record(comp, candle))
@@ -112,7 +112,7 @@ class RinoEngine:
 
     def _post_touch(self, t, row):
         self.setup.on_tf1_after(
-            t, row, self._comps, self.dol, self._prio_dir,
+            t, row, self._comps, self.dol, 0, layers=self._layers,
             key_time_raid=lambda d, ep: self._raid_hit(
                 d, ep.origin, ep.boundary,
                 ep.close_ref_low if d == 1 else ep.close_ref_high))
@@ -237,7 +237,7 @@ if __name__ == "__main__":
         if len(act):
             print(f"  grades (actionable): {act.grade.value_counts().to_dict()}")
             print(f"  targets: {act.targetTf.value_counts().to_dict()} | "
-                  f"median R: {(act.r5 / (act.entry - act.stop).abs()).median():.1f}")
+                  f"median R-to-target: {(((act.target - act.entry).abs() / (act.entry - act.stop).abs())).median():.2f}")
         tr = [x for x in eng.setup.events if x["kind"] == "RANGE_STATE"]
         print(f"  owner transitions: {pd.Series([x['to'] for x in tr]).value_counts().to_dict() if tr else {}}")
     print(f"trend state: {eng.setup.tsm.dir} | pending {eng.setup.tsm.pend_side}")
