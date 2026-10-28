@@ -1,7 +1,14 @@
 """rino_backtest.py — Model 2 (lowest level): market entry at bar-0 open, setup stop,
 T1 partials + breakeven, runner to target. Costs = lake spread only. Conservative
 same-bar rule: stop checked before targets. This is the FLOOR: what the raw model
-returns before any refinement."""
+returns before any refinement.
+
+PERF-PY-01 (2026-10-28): the per-trade hot loop originally materialized
+`list(seg.iterrows())` — up to ~140k pandas Series objects per trade. When 05 went
+dual-mode (base + d703) the backtest became the pipeline's dominant cost (>1h for
+two symbols). The loop now runs over precomputed numpy views of the same bars with
+IDENTICAL semantics; equivalence-gated against the legacy implementation on
+synthetic data (same trades, same exit reasons, same PnL). D-PY-23 dials unchanged."""
 import numpy as np
 import pandas as pd
 from lab import load, pip_size
@@ -15,6 +22,27 @@ PARTIAL = 0.6          # fraction closed at T1 (handover range 0.5-0.7)
 MOVE_BE_AFTER_T1 = True   # move stop to entry after the partial fills
 
 
+class _Bars:
+    """Precomputed numpy views of the M15 frame, built ONCE per run_backtest call
+    and shared by every trade (PERF-PY-01)."""
+
+    def __init__(self, df):
+        if not df.index.is_monotonic_increasing:
+            df = df.sort_index()
+        self.idx = df.index.values               # datetime64[ns], sorted
+        self.idx_i = self.idx.view("int64")
+        self.open = df["open"].to_numpy(float)
+        self.high = df["high"].to_numpy(float)
+        self.low = df["low"].to_numpy(float)
+        self.close = df["close"].to_numpy(float)
+        self.spread = df["spread"].to_numpy(float)
+        self.n = len(self.idx)
+
+    def pos_at(self, ts):
+        """First bar whose timestamp is >= ts (mirrors df.loc[df.index >= ts])."""
+        return int(np.searchsorted(self.idx_i, pd.Timestamp(ts).value, side="left"))
+
+
 def run_backtest(df, setups, partial=PARTIAL, mintick=MINTICK, mode="base"):
     """mode="base": T1 partial -> BE -> runner to target (the floor).
     mode="d703":  break-driven management (freeze-log D-703, quantified by 08):
@@ -23,30 +51,34 @@ def run_backtest(df, setups, partial=PARTIAL, mintick=MINTICK, mode="base"):
                   the PDOL target ONLY if a Critical break has confirmed; if T1
                   filled without one, the runner exits at the next bar's close.
                   Rationale: 08 showed non-Critical setups average ~-0.5R."""
-
+    bars = _Bars(df)
+    n = bars.n
+    has_crit = "breakCritAt" in setups.columns
     trades = []
     for _, s in setups.iterrows():
         if not s.actionable or not np.isfinite(s.stop) or not np.isfinite(s.target):
             continue
         d = 1 if s.direction == 1 else -1
-        seg = df.loc[df.index >= s.availableAt]
-        if not len(seg):
+        pos = bars.pos_at(s.availableAt)
+        if pos >= n:
             continue
-        spread_px = float(seg.iloc[0]["spread"]) * mintick
-        entry = float(seg.iloc[0]["open"]) + d * spread_px
+        spread_px = float(bars.spread[pos]) * mintick
+        entry = float(bars.open[pos]) + d * spread_px
         R = abs(entry - float(s.stop))
         if not np.isfinite(R) or R == 0:
             continue
-        stop = float(s.stop); t1 = float(s.t1) if np.isfinite(s.t1) else None
+        stop = float(s.stop)
+        t1 = float(s.t1) if np.isfinite(s.t1) else None
         t2 = float(s.target)
-        t1_done = False; pnl = 0.0; reason = "OPEN"
-        crit_at = pd.to_datetime(s.breakCritAt) if "breakCritAt" in s and pd.notna(s.breakCritAt) else None
-        if mode == "d703" and crit_at is not None and crit_at < seg.index[0]:
+        crit_at = pd.to_datetime(s.breakCritAt) if has_crit and pd.notna(s.breakCritAt) else None
+        if mode == "d703" and crit_at is not None and crit_at.value < bars.idx_i[pos]:
             crit_at = None                          # stamp predating entry = not usable
-        bars = list(seg.iterrows()); t1_bar = None
-        for i, (ts, bar) in enumerate(bars):
-            h, l, c = float(bar.high), float(bar.low), float(bar.close)
-            crit = crit_at is not None and ts >= crit_at
+        crit_ns = crit_at.value if crit_at is not None else None
+        t1_done = False; pnl = 0.0; reason = "OPEN"; t1_pos = -1
+        i = pos
+        while i < n:
+            crit = crit_ns is not None and bars.idx_i[i] >= crit_ns
+            h = bars.high[i]; l = bars.low[i]; c = bars.close[i]
             hit_sl = (l <= stop) if d == 1 else (h >= stop)
             hit_t1 = (not t1_done) and t1 is not None and ((h >= t1) if d == 1 else (l <= t1))
             hit_t2 = (h >= t2) if d == 1 else (l <= t2)
@@ -56,21 +88,23 @@ def run_backtest(df, setups, partial=PARTIAL, mintick=MINTICK, mode="base"):
                 break
             if hit_t1:
                 pnl += partial * (t1 - entry) * d / R
-                t1_done = True; t1_bar = i
+                t1_done = True; t1_pos = i
                 if MOVE_BE_AFTER_T1 or (mode == "d703" and crit):
                     stop = entry                    # breakeven (d703: T1 OR Critical)
+                i += 1
                 continue
             if hit_t2:
                 if mode == "d703" and not crit:
-                    continue                        # no confirmed spark: don't honor the far target
+                    i += 1                          # no confirmed spark: don't honor the far target
+                    continue
                 pnl += (1 if not t1_done else (1 - partial)) * (t2 - entry) * d / R
                 reason = "T2"; break
-            if mode == "d703" and t1_done and not crit and t1_bar is not None and i > t1_bar:
+            if mode == "d703" and t1_done and not crit and t1_pos >= 0 and i > t1_pos:
                 pnl += (1 - partial) * (c - entry) * d / R
                 reason = "NOCRIT"; break
+            i += 1
         else:
-            c = float(seg.iloc[-1]["close"])
-            pnl += ((1 - partial) if t1_done else 1.0) * (c - entry) * d / R
+            pnl += ((1 - partial) if t1_done else 1.0) * (float(bars.close[n - 1]) - entry) * d / R
             reason = "EOD"
         trades.append(dict(origin=s.origin, direction=d, grade=s.grade, mode=mode,
                            setupClass=s.setupClass, keyTimeSweep=bool(s.keyTimeSweep),
@@ -116,6 +150,8 @@ def run_model3(df, setups, quadrant=1.0, mintick=MINTICK, partial=PARTIAL,
        (1.0 = extreme = Techfred; 0.75/0.5/25 deeper toward the body; inverted for sells);
     4) stop untouched from availability until fill, else void;
     5) post-entry: T1 partial + BE dial + runner to the PDOL (final target)."""
+    bars = _Bars(df)
+    n = bars.n
     trades = []
     for _, s in setups.iterrows():
         if not s.actionable or not np.isfinite(s.stop) or not np.isfinite(s.target):
@@ -123,42 +159,43 @@ def run_model3(df, setups, quadrant=1.0, mintick=MINTICK, partial=PARTIAL,
         if s.breakClass not in require_class or pd.isna(s.breakAt):
             continue                                    # intent gate: no qualifying break, no trade
         d = 1 if s.direction == 1 else -1
-        brk = pd.to_datetime(s.breakAt)
         if d == 1:
             ext, body = float(s.zoneLow), float(s.zoneHigh)
         else:
             ext, body = float(s.zoneHigh), float(s.zoneLow)
         entry_price = ext + (body - ext) * (1.0 - quadrant)   # q=1.0 -> wick extreme
-        seg = df.loc[df.index >= s.availableAt]
-        if not len(seg):
+        pos = bars.pos_at(s.availableAt)
+        if pos >= n:
             continue
-        pre = seg.loc[seg.index < brk]
-        if d == 1 and (pre.low <= float(s.stop)).any():
+        brk_ns = pd.Timestamp(s.breakAt).value
+        pre_end = min(int(np.searchsorted(bars.idx_i, brk_ns, side="left")), n)
+        pre_end = max(pre_end, pos)
+        stop = float(s.stop)
+        if d == 1 and (bars.low[pos:pre_end] <= stop).any():
             continue                                    # stop ran before the break: void
-        if d == -1 and (pre.high >= float(s.stop)).any():
+        if d == -1 and (bars.high[pos:pre_end] >= stop).any():
             continue
-        after = seg.loc[seg.index >= brk]
-        if not len(after):
+        p2 = pre_end                                    # first bar >= brk (>= pos)
+        if p2 >= n:
             continue
-        fill_ts = None
-        for ts, bar in after.iterrows():
-            hit = (float(bar.low) <= entry_price) if d == 1 else (float(bar.high) >= entry_price)
-            if hit:
-                fill_ts = ts
-                break
-        if fill_ts is None:
+        if d == 1:
+            hits = np.nonzero(bars.low[p2:] <= entry_price)[0]
+        else:
+            hits = np.nonzero(bars.high[p2:] >= entry_price)[0]
+        if not len(hits):
             continue                                    # never retraced deep enough
-        spread_px = float(seg.iloc[0]["spread"]) * mintick
+        fill_pos = p2 + int(hits[0])
+        spread_px = float(bars.spread[pos]) * mintick   # legacy: bar at availableAt
         entry = entry_price + d * spread_px
-        R = abs(entry - float(s.stop))
+        R = abs(entry - stop)
         if not np.isfinite(R) or R == 0:
             continue
         t1 = float(s.t1) if np.isfinite(s.t1) else None
         t2 = float(s.target)
-        stop = float(s.stop); t1_done = False; pnl = 0.0; reason = "OPEN"
-        post = df.loc[df.index >= fill_ts]
-        for ts, bar in post.iterrows():
-            h, l, c = float(bar.high), float(bar.low), float(bar.close)
+        t1_done = False; pnl = 0.0; reason = "OPEN"
+        i = fill_pos
+        while i < n:
+            h = bars.high[i]; l = bars.low[i]; c = bars.close[i]
             hit_sl = (l <= stop) if d == 1 else (h >= stop)
             hit_t1 = (not t1_done) and t1 is not None and ((h >= t1) if d == 1 else (l <= t1))
             hit_t2 = (h >= t2) if d == 1 else (l <= t2)
@@ -171,14 +208,15 @@ def run_model3(df, setups, quadrant=1.0, mintick=MINTICK, partial=PARTIAL,
                 t1_done = True
                 if MOVE_BE_AFTER_T1:
                     stop = entry
+                i += 1
                 continue
             if hit_t2:
                 pnl += (1 if not t1_done else (1 - partial)) * (t2 - entry) * d / R
                 reason = "T2"
                 break
+            i += 1
         else:
-            c = float(post.iloc[-1]["close"])
-            pnl += ((1 - partial) if t1_done else 1.0) * (c - entry) * d / R
+            pnl += ((1 - partial) if t1_done else 1.0) * (float(bars.close[n - 1]) - entry) * d / R
             reason = "EOD"
         trades.append(dict(origin=s.origin, direction=d, grade=s.grade, model="m3",
                            quadrant=quadrant, breakClass=s.breakClass,

@@ -45,3 +45,11 @@ EXECUTOR CONTRACT
 If any instruction is ambiguous or missing, STOP and ask — do not
 fill gaps with judgment. If you changed code the user did not paste
 verbatim, that is a contract violation: say so immediately.
+
+SOURCES OF TRUTH (strict order):
+1. RINO System Documentation + freeze logs + DECISIONS.md — behavior authority.
+2. Frozen Pine / Python port — executable truth (D-PY-16: executed code, not comments).
+3. CRT & TS Guide, DOL pdf, HTF Mystery Book, RANGE_POI_MIT notes —
+   HYPOTHESIS LIBRARIES ONLY. They may propose predicates; they never define
+   them. A concept enters the system only via: precise definition → fixture →
+   gate → replication. No exceptions, regardless of the source's reputation.
