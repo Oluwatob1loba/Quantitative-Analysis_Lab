@@ -388,6 +388,10 @@ class SetupEngine:
                     pr = {"Critical": 3, "Major": 2, "Minor": 1}.get(s["breakClass"], 0)
                     if rank >= pr:
                         s["breakClass"] = cls
+                        if s["breakAt"] is None:
+                            s["breakAt"] = t            # first post-entry break arrival
+                        if cls == "Critical":
+                            s["breakCritAt"] = t        # confirmed-spark stamp
                         g, sc = grade(s, self.cfg)
                         if g != s["grade"]:
                             s["grade"] = g; s["score"] = sc
@@ -472,6 +476,19 @@ class SetupEngine:
                     fvg_tag = fvg_tag or g.kind == "FVG"
                     vi_tag = vi_tag or g.kind == "VI"
             kts = key_time_raid(direction, ep) if key_time_raid else False
+            # D-PY-27 (architect ruling): attach the PDOL->TS candle SERIES extremes.
+            # series = confirmed TF1 candles from the undisturbed-PDOL candle (targetOrigin,
+            # inclusive) through the TS opening candle (episode.origin, inclusive). The PDOL
+            # draw remains the FINAL/DONE target; these fields feed future scaling-out logic.
+            series_hi = series_lo = None
+            if tgt_org is not None:
+                lo_b, hi_b = min(tgt_org, ep.origin), max(tgt_org, ep.origin)
+                hv, lv = None, None
+                for (cb, _o, _h, _l, _c) in self.feed.hist:
+                    if lo_b <= cb <= hi_b:
+                        hv = _h if hv is None else max(hv, _h)
+                        lv = _l if lv is None else min(lv, _l)
+                series_hi, series_lo = hv, lv
             alig = bool(actionable and alignment(
                 all_recs, direction, entry, tgt_tf if tgt is not None else "",
                 self.k1, self.rank_of, self.cfg))
@@ -502,6 +519,9 @@ class SetupEngine:
                  "dualHit": False, "caution": bool(self.tsm.pend_side != 0
                                                    and self.tsm.pend_side == direction),
                  "contextReason": reason, "poiDiag": diag, "t1": t1, "t1Flipped": t1_flip,
+                 "seriesHigh": series_hi, "seriesLow": series_lo,
+                 "seriesStart": tgt_org, "seriesEnd": ep.origin,
+                 "breakAt": None, "breakCritAt": None,
                  "keyTimeSweep": kts, "grade": "", "score": None}
             g, sc = grade(s, self.cfg)
             s["grade"], s["score"] = g or "", sc

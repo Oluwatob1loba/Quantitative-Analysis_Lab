@@ -193,16 +193,23 @@ class RinoEngine:
         return rec
 
     # ------------------------------------------------------------------ driver
-    def run(self, df):
+    def run(self, df, verbose=False):
+        import time as _t
         self._df = df
-        df = self.tf1.run(df)
+        t0 = _t.time()
+        df = self.tf1.run(df); t1 = _t.time()
         df = self.tf2.run(df)
         for sw in self.tf2.swings:
             if sw.end_reason == "invalidated":
                 self.tf2_index.setdefault((sw.end_time, sw.observed_at), []).append(sw)
+        t2 = _t.time()
         df = self.dol.run(df, self.tf1, between=self._episode_step,
                           after=self._post_touch, on_tf2=self._tf2_step,
                           tf2=self.cfg.tf2)
+        t3 = _t.time()
+        if verbose:
+            print(f"    stages: tf1 {t1-t0:.1f}s | tf2 {t2-t1:.1f}s | "
+                  f"dol+episodes+setups {t3-t2:.1f}s | rolls {len(self.tf1_origins)}")
         return df
 
     def frame(self):
