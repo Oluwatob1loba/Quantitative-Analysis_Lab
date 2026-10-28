@@ -27,7 +27,7 @@ from lab import load
 
 # ---------------- dials ----------------
 SYMBOL = "EURUSD"      # which symbol's setups to draw
-PRICE_TF = "4h"        # candle size for the price backdrop ("1h"/"4h"/"1D")
+PRICE_TF = "1D"        # candle size for the price backdrop ("1h"/"4h"/"1D")
 WINDOW_DAYS = 60       # length of the time window (slide it from the browser)
 START_AT = None        # "YYYY-MM-DD" to center the window elsewhere, None = latest data
 SHOW_CONTEXT = True    # True = also draw CONTEXT records (faded)
@@ -63,11 +63,15 @@ y_pad = (y_hi - y_lo) * 0.08 or 1e-5
 
 # optional: attach backtest outcomes
 outcome = {}
-trades_path = f"reports/trades_{SYMBOL}.csv"
-if os.path.exists(trades_path):
-    tr = pd.read_csv(trades_path, parse_dates=["origin"])
-    for _, t in tr.iterrows():
+try:
+    from rino_backtest import run_backtest
+    from lab import pip_size
+    _tr = run_backtest(lake, su, mintick=pip_size(SYMBOL) / 10, mode="base")
+    for _, t in _tr.iterrows():
         outcome[(t.origin, int(t.direction))] = f"{t.pnl_R:+.2f}R ({t.reason})"
+    print(f"outcomes: BASE mode, {len(_tr)} trades (computed here, not read from the 05 CSV)")
+except Exception as e:
+    print(f"outcomes unavailable ({e}) - hover cards will skip results")
 
 def hover_card(r):
     grade = r.get("grade", "?"); grade = "?" if pd.isna(grade) else grade
@@ -88,11 +92,22 @@ def hover_card(r):
         bits.append(f"outcome: {outcome[k]}")
     return "<br>".join(bits)
 
+CANDLE_PAD_DAYS = 120     # render candles only this far past the window (freedom without weight)
+pad_lo, pad_hi = win_start - pd.Timedelta(days=CANDLE_PAD_DAYS), win_end + pd.Timedelta(days=CANDLE_PAD_DAYS)
+pc = px[(px.index >= pad_lo) & (px.index <= pad_hi)]
+daily = lake.resample("1D").agg({"low": "min", "high": "max"}).dropna()
+
 fig = go.Figure()
 fig.add_trace(go.Candlestick(
-    x=px.index, open=px.open, high=px.high, low=px.low, close=px.close,
-    name=f"{SYMBOL} {PRICE_TF}",
-    increasing_line_color="#26a69a", decreasing_line_color="#ef5350"))
+    x=pc.index, open=pc.open, high=pc.high, low=pc.low, close=pc.close,
+    name=f"{SYMBOL} {PRICE_TF} (window +/-{CANDLE_PAD_DAYS}d)",
+    increasing_line_color="#26a69a", decreasing_line_color="#ef5350", showlegend=False))
+fig.add_trace(go.Scatter(x=pc.index, y=pc.close, mode="lines",
+    line=dict(color="#26a69a", width=3), name=f"{SYMBOL} {PRICE_TF}", legendgroup="price",
+    showlegend=True, hoverinfo="skip"))
+fig.add_trace(go.Scatter(x=daily.index, y=(daily.low + daily.high) / 2, mode="lines",
+    line=dict(color="#3a3a3a", width=1), name="context (1D)", legendgroup="ctx1d",
+    showlegend=False, hoverinfo="skip"))
 
 for direction, dname, color in [(1, "LONG", "#2ecc71"), (-1, "SHORT", "#e74c3c")]:
     sub = act[act.direction == direction]
@@ -113,6 +128,41 @@ if SHOW_CONTEXT:
         name=f"CONTEXT ({len(ctx)})", legendgroup="ctx",
         text=[hover_card(r) for _, r in ctx.iterrows()], hoverinfo="text"))
 
+# gate-provider check: D1 FVGs from the lake whose band intersects an
+# actionable setup's slice - answers "are gated setups on REAL gaps?" visually
+SHOW_FVG = True
+d1 = lake.resample("1D").agg({"low": "min", "high": "max", "open": "first", "close": "last"}).dropna()
+bx, by, sx, sy, btxt, stxt = [], [], [], [], [], []
+for i in range(2, len(d1)):
+    lo0, hi0 = float(d1.low.iloc[i]), float(d1.high.iloc[i])
+    hi2, lo2 = float(d1.high.iloc[i - 2]), float(d1.low.iloc[i - 2])
+    if lo0 > hi2:
+        band = (hi2, lo0); kind = 1
+    elif hi0 < lo2:
+        band = (hi0, lo2); kind = -1
+    else:
+        continue
+    hit = None
+    for _, r in act.iterrows():
+        zl, zh = r.get("zoneLow"), r.get("zoneHigh")
+        if pd.notna(zl) and pd.notna(zh) and max(band[0], zl) <= min(band[1], zh):
+            hit = r; break
+    if hit is None:
+        continue
+    y = (band[0] + band[1]) / 2
+    txt = f"FVG {'bull' if kind == 1 else 'bear'} [{band[0]:g}, {band[1]:g}] - provider for {hit.origin:%Y-%m-%d} {'LONG' if hit.direction == 1 else 'SHORT'}"
+    if kind == 1:
+        bx.append(d1.index[i]); by.append(y); btxt.append(txt)
+    else:
+        sx.append(d1.index[i]); sy.append(y); stxt.append(txt)
+if SHOW_FVG and (bx or sx):
+    fig.add_trace(go.Scatter(x=bx, y=by, mode="markers",
+        marker=dict(symbol="square", size=7, color="#3b82f6", line=dict(width=1, color="white")),
+        name=f"FVG bull provider ({len(bx)})", legendgroup="fvgb", text=btxt, hoverinfo="text"))
+    fig.add_trace(go.Scatter(x=sx, y=sy, mode="markers",
+        marker=dict(symbol="square", size=7, color="#f59e0b", line=dict(width=1, color="white")),
+        name=f"FVG bear provider ({len(sx)})", legendgroup="fvgs", text=stxt, hoverinfo="text"))
+
 def seg_trace(sub, col, name, color, dash, group):
     xs, ys = [], []
     for _, r in sub.iterrows():
@@ -127,36 +177,52 @@ if len(act):
     fig.add_trace(seg_trace(act, "target", "Target", "Gold", None, "target"))
     fig.add_trace(seg_trace(act, "stop", "Stop", "#999999", "dot", "stop"))
 
+def _ts(r, col):
+    """seriesStart/seriesEnd arrive as epoch-MS numbers; pd.to_datetime(int)
+    would read nanoseconds and land in 1970, stretching boxes to the chart's
+    left edge. Parse numerics explicitly and sanity-floor the result."""
+    x = r.get(col)
+    if x is None or pd.isna(x):
+        return None
+    if hasattr(x, "year"):
+        return x
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return pd.to_datetime(x)                      # ISO string
+    if not np.isfinite(f) or f < 1e11:                 # ~1973+ in epoch ms
+        return None
+    return pd.to_datetime(f, unit="ms")
+
 for _, r in act.iterrows():   # boxes only for actionable: keeps the SVG light
     t_fut = r.availableAt + pd.Timedelta(days=3)
     edge = "#2ecc71" if r.direction == 1 else "#e74c3c"
-    fig.add_shape(type="rect", x0=r.origin, y0=r.manLow, x1=r.availableAt, y1=r.manHigh,
-                  line=dict(color="RoyalBlue", width=1),
-                  fillcolor="rgba(65,105,225,0.12)")
+    # display box = the EPISODE extent (soup -> completion). The series span
+    # (old draw -> soup) is research attachment, not display - architect feedback.
+    bx0, bx1 = r.origin, r.availableAt
+    fig.add_shape(type="rect", x0=bx0, y0=r.manLow, x1=bx1, y1=r.manHigh,
+                  line=dict(color="RoyalBlue", width=0.6),
+                  fillcolor="rgba(65,105,225,0.07)")
     if r.get("zoneLow") == r.get("zoneLow"):
         fig.add_shape(type="rect", x0=r.availableAt, y0=r.zoneLow, x1=t_fut, y1=r.zoneHigh,
                       line=dict(color=edge, width=1, dash="dash"),
                       fillcolor="rgba(128,128,128,0.10)")
 
 fig.update_layout(
-    title=f"RINO eyeball - {SYMBOL} | {PRICE_TF} | drag the bottom strip to move the window",
+    title=dict(text=f"RINO eyeball - {SYMBOL} | {PRICE_TF}", font=dict(size=15)),
     template="plotly_dark", hovermode="closest", dragmode="pan",
+    font=dict(family="Manrope, Geist, Segoe UI, sans-serif", size=13, color="#d9d9d9"),
     xaxis=dict(rangeslider=dict(visible=True),
                range=[win_start, win_end]),
     yaxis=dict(range=[y_lo - y_pad, y_hi + y_pad], fixedrange=False),
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-    margin=dict(t=90, b=40),
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
+                font=dict(size=12), bgcolor="rgba(0,0,0,0)"),
+    margin=dict(t=95, b=40),
 )
-fig.update_xaxes(rangeselector=dict(buttons=[
-    dict(count=1, label="1m", step="month", stepmode="backward"),
-    dict(count=3, label="3m", step="month", stepmode="backward"),
-    dict(count=6, label="6m", step="month", stepmode="backward"),
-    dict(count=1, label="1y", step="year", stepmode="backward"),
-    dict(step="all", label="all")]))
 
 # --- embedded y-refit: y-axis follows whichever time window is visible ---
-_t = (px.index.view("int64") // 10**6).tolist()   # ms ints
-_lo = px.low.tolist(); _hi = px.high.tolist()
+_t = (daily.index.view("int64") // 10**6).tolist()   # daily context: full span
+_lo = daily.low.tolist(); _hi = daily.high.tolist()
 js = """
 try {
   var T = __T__, LO = __LO__, HI = __HI__, N = T.length;

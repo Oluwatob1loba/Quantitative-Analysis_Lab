@@ -73,6 +73,10 @@ One line per ruling. Amendments replace the line and cite the date; nothing is d
 
 D-PY-29 | Authority precedence codified: conceptual PDFs rank below the frozen system documents; they generate hypotheses, the repo arbitrates. (2026-10-28)
 
+D-PY-31 | model files separated per architect (M1=souped-candle-end target, M2=bar-0/quadrant-limits ungated, M3=full gate stack); engine shared, models consume | ratified 2026-10-28
+
+D-PY-32 | timeframe ladders universal across FX/metals/indices (rino_pairings.py).
+
 WE ARE HERE (2026-10-24): all four foundation boards green in the sandbox on a synthetic lake after BUG-PY-05 + TEST-PY-02/03 + D-PY-18; rino_episode.py + test_episode.py delivered (25/25 fixture gates) awaiting orchestrator. NEXT: architect to rule the D-PY-21 open question (re-sweep eligibility). Then rino_setup.py per the LIVE frozen pine AS AMENDED BY D-PY-20 (flat sweeps): targets, F-strict slice POI gate (the 9/25 SDOL-into-FVG case is now admissible and testable), class A/B with grade-B cap, TSM trend gate, ownership, poiDiag export. NOTE: with D-PY-20 ruled, Pine and the port now differ systematically on sweep admission; either Pine gets the same patch or the parity harness is defined against the amended spec (D-PY-20).
 
 WE ARE HERE (superseded 2026-10-19): clocks, TF1 anatomy, TF2 structure (bias-free per D-PY-15) and DOL lifecycle ported; test_dol Gates 1-5, 7 green, Gate 6 pending the D-PY-17 re-key; next: seven-green test_dol and test_tf2 re-run, then rino_episode.py (window packet [2] offset, opening pairwise sweep over covered state-0 PDOLs, frozen bounds with swept-side fallbacks, close-reference completion at main+1).

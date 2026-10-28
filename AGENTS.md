@@ -53,3 +53,10 @@ SOURCES OF TRUTH (strict order):
    HYPOTHESIS LIBRARIES ONLY. They may propose predicates; they never define
    them. A concept enters the system only via: precise definition → fixture →
    gate → replication. No exceptions, regardless of the source's reputation.
+
+   EYE-TEST PROTOCOL: never explain a TV-vs-Python diff by assuming either side
+is stale. Classify first: (A) freeze-scope logic -> both SHOULD match; any
+diff is a REAL discrepancy - log date, TV's verdict, Python's verdict, and
+hand it to the parity harness as a fixture. (B) post-freeze Python rulings
+(D-PY-20/21/22/27/28) -> documented divergence, parity defined against the
+amended spec. When unsure which bucket, assume A and prove otherwise.
