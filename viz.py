@@ -2,29 +2,35 @@
 
 Cheapest possible visual parity harness: real price candles from your
 own lake plus every setup the engine emitted, each layer toggleable from
-the legend. Rewrite of the original viz: the old one never drew price
-at all (markers floated on an empty axis) and gave every one of ~375
-setups its own legend row (~1,100 entries), which buried the chart.
+the legend.
 
-Dials at the top. Everything else is automatic:
-- price candles resampled from the lake (no TradingView needed)
-- layers: LONG / SHORT markers, CONTEXT, targets, stops, CRT windows,
-  F-strict POI slices
-- hover any marker for the full setup card: direction, class, grade,
-  target timeframe, confluence, key-time raid tag, break class, and the
-  backtest outcome when reports/trades_<SYMBOL>.csv exists
+HOW TO DRIVE IT (Plotly controls, all in the browser):
+- BOTTOM GREY STRIP = time machine. Drag its handles to set window size;
+  drag its middle to slide the window across the whole history.
+- BOX-DRAG on the plot = zoom that region. DOUBLE-CLICK = reset.
+- MOUSE WHEEL = zoom at cursor.
+- The y-axis RE-FITS to whatever time window is showing (small embedded
+  script; if your browser blocks it, the initial window is still fitted
+  and you can zoom manually).
+- Hover any marker for the full setup card.
+
+Dials at the top of this file. The terminal prints the lake span and the
+exact window shown, so "is this really 60 days?" is always answerable.
 """
 import os
+import json
 import webbrowser
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from lab import load
 
 # ---------------- dials ----------------
 SYMBOL = "EURUSD"      # which symbol's setups to draw
-PRICE_TF = "1H"        # candle size for the price backdrop ("1H"/"4H"/"1D")
-LAST_DAYS = 365        # window shown on load; zoom out for full history
-SHOW_CONTEXT = False   # True = also draw CONTEXT records (faded)
+PRICE_TF = "4h"        # candle size for the price backdrop ("1h"/"4h"/"1D")
+WINDOW_DAYS = 60       # length of the time window (slide it from the browser)
+START_AT = None        # "YYYY-MM-DD" to center the window elsewhere, None = latest data
+SHOW_CONTEXT = True    # True = also draw CONTEXT records (faded)
 # --------------------------------------
 
 setups_path = f"reports/setups_{SYMBOL}.csv"
@@ -35,12 +41,27 @@ su = pd.read_csv(setups_path, parse_dates=["origin", "availableAt"])
 lake = load(SYMBOL)
 agg = {c: f for c, f in [("open", "first"), ("high", "max"),
                           ("low", "min"), ("close", "last")] if c in lake.columns}
-px = lake.resample(PRICE_TF).agg(agg).dropna(subset=["open", "high", "low", "close"])
+px = lake.resample(PRICE_TF.lower()).agg(agg).dropna(subset=["open", "high", "low", "close"])
+
+# window: [win_start, win_end] fitted from dials; printed for diagnosis
+last = px.index[-1]
+if START_AT:
+    win_end = min(pd.Timestamp(START_AT) + pd.Timedelta(days=WINDOW_DAYS), last)
+else:
+    win_end = last
+win_start = win_end - pd.Timedelta(days=WINDOW_DAYS)
 
 act = su[su["actionable"] == True].copy()
-print(f"{SYMBOL}: {len(px)} {PRICE_TF} candles | {len(act)} actionable / {len(su)} total setups")
+print(f"{SYMBOL}: {len(px)} {PRICE_TF} candles | lake {px.index[0]:%Y-%m-%d} -> {last:%Y-%m-%d}")
+print(f"window shown: {win_start:%Y-%m-%d} -> {win_end:%Y-%m-%d} "
+      f"({(win_end - win_start).days} days) | {len(act)} actionable / {len(su)} total setups")
 
-# optional: attach backtest outcomes (from rino_backtest / 05_multisymbol)
+# fitted y fallback (used if the y-refit script is blocked)
+m = (px.index >= win_start) & (px.index <= win_end)
+y_lo, y_hi = float(px.low[m].min()), float(px.high[m].max())
+y_pad = (y_hi - y_lo) * 0.08 or 1e-5
+
+# optional: attach backtest outcomes
 outcome = {}
 trades_path = f"reports/trades_{SYMBOL}.csv"
 if os.path.exists(trades_path):
@@ -49,8 +70,7 @@ if os.path.exists(trades_path):
         outcome[(t.origin, int(t.direction))] = f"{t.pnl_R:+.2f}R ({t.reason})"
 
 def hover_card(r):
-    grade = r.get("grade", "?")
-    grade = "?" if pd.isna(grade) else grade
+    grade = r.get("grade", "?"); grade = "?" if pd.isna(grade) else grade
     bits = [
         f"<b>{'LONG' if r.direction == 1 else 'SHORT'} "
         f"{r.get('setupClass','?')} / grade {grade}</b>",
@@ -69,14 +89,11 @@ def hover_card(r):
     return "<br>".join(bits)
 
 fig = go.Figure()
-
-# 1) price candles - the backdrop the old viz was missing
 fig.add_trace(go.Candlestick(
     x=px.index, open=px.open, high=px.high, low=px.low, close=px.close,
     name=f"{SYMBOL} {PRICE_TF}",
     increasing_line_color="#26a69a", decreasing_line_color="#ef5350"))
 
-# 2) setup markers - ONE trace per direction (not one per setup)
 for direction, dname, color in [(1, "LONG", "#2ecc71"), (-1, "SHORT", "#e74c3c")]:
     sub = act[act.direction == direction]
     if not len(sub):
@@ -88,7 +105,6 @@ for direction, dname, color in [(1, "LONG", "#2ecc71"), (-1, "SHORT", "#e74c3c")
         name=f"Setup {dname}", legendgroup=f"setup{direction}",
         text=[hover_card(r) for _, r in sub.iterrows()], hoverinfo="text"))
 
-# 3) CONTEXT markers (optional, faded - label-only, never actionable)
 if SHOW_CONTEXT:
     ctx = su[su["actionable"] != True]
     fig.add_trace(go.Scatter(
@@ -97,7 +113,6 @@ if SHOW_CONTEXT:
         name=f"CONTEXT ({len(ctx)})", legendgroup="ctx",
         text=[hover_card(r) for _, r in ctx.iterrows()], hoverinfo="text"))
 
-# 4) targets + stops - one NaN-separated trace each (toggleable layers)
 def seg_trace(sub, col, name, color, dash, group):
     xs, ys = [], []
     for _, r in sub.iterrows():
@@ -112,26 +127,23 @@ if len(act):
     fig.add_trace(seg_trace(act, "target", "Target", "Gold", None, "target"))
     fig.add_trace(seg_trace(act, "stop", "Stop", "#999999", "dot", "stop"))
 
-# 5) CRT window + F-strict POI slice per setup (shapes stay subtle)
-for _, r in su.iterrows():
+for _, r in act.iterrows():   # boxes only for actionable: keeps the SVG light
     t_fut = r.availableAt + pd.Timedelta(days=3)
-    is_long = r.direction == 1
-    edge = "#2ecc71" if is_long else "#e74c3c"
+    edge = "#2ecc71" if r.direction == 1 else "#e74c3c"
     fig.add_shape(type="rect", x0=r.origin, y0=r.manLow, x1=r.availableAt, y1=r.manHigh,
                   line=dict(color="RoyalBlue", width=1),
                   fillcolor="rgba(65,105,225,0.12)")
-    if r.get("zoneLow") == r.get("zoneLow"):  # not NaN
+    if r.get("zoneLow") == r.get("zoneLow"):
         fig.add_shape(type="rect", x0=r.availableAt, y0=r.zoneLow, x1=t_fut, y1=r.zoneHigh,
                       line=dict(color=edge, width=1, dash="dash"),
                       fillcolor="rgba(128,128,128,0.10)")
 
-# 6) layout: dark, legend along the top, every layer one toggleable row
-end = px.index[-1]
 fig.update_layout(
-    title=f"RINO eyeball - {SYMBOL} | {PRICE_TF} | hover any marker for the setup card",
-    template="plotly_dark", hovermode="closest",
-    xaxis=dict(rangeslider=dict(visible=True), range=[end - pd.Timedelta(days=LAST_DAYS), end]),
-    yaxis=dict(title="Price"),
+    title=f"RINO eyeball - {SYMBOL} | {PRICE_TF} | drag the bottom strip to move the window",
+    template="plotly_dark", hovermode="closest", dragmode="pan",
+    xaxis=dict(rangeslider=dict(visible=True),
+               range=[win_start, win_end]),
+    yaxis=dict(range=[y_lo - y_pad, y_hi + y_pad], fixedrange=False),
     legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
     margin=dict(t=90, b=40),
 )
@@ -139,9 +151,42 @@ fig.update_xaxes(rangeselector=dict(buttons=[
     dict(count=1, label="1m", step="month", stepmode="backward"),
     dict(count=3, label="3m", step="month", stepmode="backward"),
     dict(count=6, label="6m", step="month", stepmode="backward"),
+    dict(count=1, label="1y", step="year", stepmode="backward"),
     dict(step="all", label="all")]))
 
+# --- embedded y-refit: y-axis follows whichever time window is visible ---
+_t = (px.index.view("int64") // 10**6).tolist()   # ms ints
+_lo = px.low.tolist(); _hi = px.high.tolist()
+js = """
+try {
+  var T = __T__, LO = __LO__, HI = __HI__, N = T.length;
+  var gd = document.querySelector('.js-plotly-plot') || document.querySelector('.plotly-graph-div');
+  var self_echo = false;
+  function lowerBound(x) { var lo = 0, hi = N - 1; while (lo < hi) { var m = (lo + hi) >> 1; if (T[m] < x) lo = m + 1; else hi = m; } return lo; }
+  function upperBound(x) { var lo = 0, hi = N - 1; while (lo < hi) { var m = (lo + hi + 1) >> 1; if (T[m] > x) hi = m - 1; else lo = m; } return lo; }
+  function refitY() {
+    var lay = gd.layout; if (!lay || !lay.xaxis || !lay.xaxis.range) return;
+    var x0 = new Date(lay.xaxis.range[0]).getTime();
+    var x1 = new Date(lay.xaxis.range[1]).getTime();
+    var i0 = lowerBound(x0), i1 = upperBound(x1); if (i1 < i0) return;
+    var mn = Infinity, mx = -Infinity;
+    for (var i = i0; i <= i1; i++) { if (LO[i] < mn) mn = LO[i]; if (HI[i] > mx) mx = HI[i]; }
+    var pad = (mx - mn) * 0.08 || 1e-5;
+    self_echo = true;
+    Plotly.relayout(gd, {"yaxis.range": [mn - pad, mx + pad], "yaxis.autorange": false});
+  }
+  var timer = null;
+  gd.on("plotly_relayout", function () {
+    if (self_echo) { self_echo = false; return; }
+    clearTimeout(timer);
+    timer = setTimeout(function () { try { refitY(); } catch (e) {} }, 120);
+  });
+  refitY();
+} catch (e) {}
+"""
+js = js.replace("__T__", json.dumps(_t)).replace("__LO__", json.dumps(_lo)).replace("__HI__", json.dumps(_hi))
+
 html_path = os.path.abspath("reports/rino_chart.html")
-fig.write_html(html_path)
+fig.write_html(html_path, config={"scrollZoom": True, "displaylogo": False}, post_script=js)
 print(f"Success! Open: {html_path}")
 webbrowser.open(f"file://{html_path}")
