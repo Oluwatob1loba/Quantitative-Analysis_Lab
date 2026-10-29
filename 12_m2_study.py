@@ -41,6 +41,7 @@ CLASS_MIN = None                          # e.g. "A" -> only A/A+; None = all
 RAID_ONLY = False
 PARTIAL, MOVE_BE = 0.6, True
 FILL_MAX_DAYS = 5                         # skip limit fills older than this
+SETS_PREFIX = 'setups_'                   # 'setups_m2_' for the D-PY-33 raw population
 
 _spec = importlib.util.spec_from_file_location("opt", "10_optimize.py")
 _opt = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_opt)
@@ -61,7 +62,7 @@ def reconstruct(row, mintick):
 
 
 def sim_symbol(sym):
-    sp = f"reports/setups_{sym}.csv"
+    sp = f"reports/{SETS_PREFIX}{sym}.csv"
     if not os.path.exists(sp):
         return None
     su = pd.read_csv(sp, parse_dates=["origin", "availableAt"])

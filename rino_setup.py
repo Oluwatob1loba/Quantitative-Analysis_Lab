@@ -1,6 +1,9 @@
 """
 rino_setup.py — RINO setup engine (live frozen pine port, as amended by D-PY-20/22).
 
+Admission mode D-PY-33: 'm2' bypasses the TSM direction gate and the FVG POI gate
+AT RECORD TIME (default 'full' = frozen V3.2-TSM-L1-O9 behavior).
+
 Turns completed episodes into graded setups:
   geometry (P4.11) | targets f_v3PickTarget (slot priority, nearest, DOC-08 quirk)
   TSM direction gate (live pine) | POI gate (F-strict slice, live executed semantics:
@@ -134,10 +137,12 @@ def pick_target(cfg, direction, entry, manipulation_start, tf1_records, anchor_r
             continue
         if is_anchor:
             raw = r.tf_key
-            # S-6 (ratified): HIGHEST anchor authority first — A3 slot 0, A2 slot 1, A1 slot 2.
-            pri = 0 if len(cfg.anchors) > 2 and raw == tf_key_(cfg.anchors[2].tf) else \
+            # V3.2 parity (EXECUTED f_v3PickTarget): A1 slot = 0 FIRST, A2 = 1, A3 = 2, TF1 = 3.
+            # The O-9 'highest-first' text was never applied to this function in the live
+            # Pine (D-PY-16: executed code wins). Architect ruling pending: patch Pine or re-ratify.
+            pri = 0 if raw == tf_key_(cfg.anchors[0].tf) else \
                   1 if len(cfg.anchors) > 1 and raw == tf_key_(cfg.anchors[1].tf) else \
-                  2 if raw == tf_key_(cfg.anchors[0].tf) else 4
+                  2 if len(cfg.anchors) > 2 and raw == tf_key_(cfg.anchors[2].tf) else 4
         else:
             pri = 3
         d = abs(price - entry)
@@ -272,17 +277,19 @@ class TrendState:
                 bear = True
         return 1 if bull and not bear else -1 if bear and not bull else 0
 
-    def update(self, act_side, act_anchor, anchor_records, anchor_keys_on):
-        if act_side == 0:
-            return
+    def update(self, act_side, act_anchor, anchor_records, anchor_keys_on, t=None):
+        """Apply the highest-authority event (A3 -> A2 -> A1 -> TF1 per the caller).
+        BOS refresh stamps last_bos; anchor events flip; a TF1 flip is subordinated to
+        any active anchor still holding an undisturbed covered PDOL on the old side."""
         if self.dir == act_side:
+            self.last_bos = t            # TSM-2 BOS refresh stamp (D-901 diagnostics)
             self.pend_side = 0
             return
         if act_anchor:
-            self.dir = act_side; self.pend_side = 0
+            self.dir = act_side; self.since = t; self.pend_side = 0
             return
         if self.dir == 0:
-            self.dir = act_side; self.pend_side = 0
+            self.dir = act_side; self.since = t; self.pend_side = 0
             return
         holds = any(r.role == "PDOL" and r.state == 0 and r.coverage and
                     (r.owner.kind if hasattr(r.owner, "kind") else r.owner.side)
@@ -291,8 +298,7 @@ class TrendState:
         if holds:
             self.pend_side = act_side
         else:
-            self.dir = act_side; self.pend_side = 0
-
+            self.dir = act_side; self.since = t; self.pend_side = 0
 
 # -------------------------------------------------------------------------- export
 def ts_export(s, k1):
@@ -440,17 +446,19 @@ class SetupEngine:
                 self.cfg, direction, entry, ep.origin, tf1_recs, anc_recs, self.rank_of)
             actionable = tgt is not None
             reason = "" if actionable else "no clean PDOL target (TF1 or higher)"
-            # TSM direction gates (live pine)
-            if actionable and self.tsm.dir != 0 and self.tsm.dir != direction:
-                actionable = False; reason = f"opposes trend (trend {self.tsm.dir} vs dir {direction})"
-            if actionable and self.tsm.dir == 0 and prio != 0 and prio != direction:
-                actionable = False; reason = f"opposes TF1 draw (prio {prio} vs dir {direction})"
+            # TSM direction gates (live pine) - D-PY-33: bypassed when admission == "m2"
+            if self.cfg.admission == "full":
+                if actionable and self.tsm.dir != 0 and self.tsm.dir != direction:
+                    actionable = False; reason = f"opposes trend (trend {self.tsm.dir} vs dir {direction})"
+                if actionable and self.tsm.dir == 0 and prio != 0 and prio != direction:
+                    actionable = False; reason = f"opposes TF1 draw (prio {prio} vs dir {direction})"
             slice_lo = ep.l if direction == 1 else max(ep.o, ep.c)
             slice_hi = min(ep.o, ep.c) if direction == 1 else ep.h
             pend = [(g.direction, g.lower, g.upper, g.available_at) for g in self.feed.candidates_today()]
             hit, diag = poi_gate(self.feed.gaps, direction, ep.origin, ep.boundary,
                                  slice_lo, slice_hi, pend, self.cfg.tf1_fvg, self.k1)
-            if actionable and not hit:
+            # POI gate - D-PY-33: bypassed when admission == "m2"
+            if self.cfg.admission == "full" and actionable and not hit:
                 actionable = False; reason = "no POI souped: " + diag
             conf_tgt = tgt if tgt is not None else entry
             conf_tf = tgt_tf if tgt is not None else self.k1
@@ -459,7 +467,12 @@ class SetupEngine:
                                        self.k1, self.mintick, self.cfg.v3_dol_proximity_pct,
                                        self.rank_of, self.cfg)
             intact = intact_primary(tf1_recs, direction, entry, ep.boundary)
-            _po, _pc = self._prev_oc(dol, ep.origin)
+            # V3.2 parity (C-6/D-101): prev = candle before the COMPLETING candle -
+            # live tf1PrevO/tf1PrevC = open[2]/close[2] at the completion roll
+            # (hist[-1] is this roll's completing candle). NOT the candle before the
+            # episode origin: that diverges for every WindowMulti setup.
+            _po, _pc = (self.feed.hist[-2][1], self.feed.hist[-2][4]) \
+                if len(self.feed.hist) >= 2 else (None, None)
             cls = setup_class(ep.o, ep.c, _po, _pc)
             if cls == "A" and layers > 0:
                 cls = "A+"
@@ -554,7 +567,7 @@ class SetupEngine:
                 break
         act_side = act_anchor_side if act_anchor_side != 0 else ev_t
         self.tsm.update(act_side, act_anchor_side != 0, anc_recs,
-                        [a.enabled for a in self.cfg.anchors])
+                        [a.enabled for a in self.cfg.anchors], t=t)
         self.anchor_ev = {}
         # horizon eviction
         anchor_cut = None

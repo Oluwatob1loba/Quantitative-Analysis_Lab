@@ -97,6 +97,15 @@ class RinoConfig:
     key_time_check_tf: str = "15min"
     key_times: List[SessionCfg] = field(default_factory=lambda: KEY_TIMES)
     utc_offset_fixed: int = 1
+    # D-PY-33 (architect ruling 2026-10-28): admission mode.
+    # 'full' = frozen Model-3 stack (TSM direction gate + FVG POI gate ACTIVE) - default,
+    #          byte-identical to the certified port.
+    # 'm2'   = raw price-delivery population: BOTH gates bypassed at record time
+    #          (episodes still require a tradeable PDOL target). Geometry is stamped on
+    #          every admitted setup; breakClass/confluence/class remain as EVIDENCE,
+    #          non-gating. M3 records and M2 population never share a CSV.
+    admission: str = 'full'
+
 
 
 PRESET_A = RinoConfig(

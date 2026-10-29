@@ -58,7 +58,12 @@ class RinoEngine:
         self.rank_of = {"tf1_key": k1, "1D": 1.0, "4h": 4 / 24.0, "1W": 7.0,
                           "1M": 30.4375, "3M": 91.3125, "15min": 15 / 1440.0,
                           "30min": 30 / 1440.0, "1h": 1 / 24.0}
-        self.rank_of.setdefault(k1, 1.0)
+self.rank_of.setdefault(k1, 1.0)
+        # D-PY-34: fail-fast on unmapped timeframes (no silent defaults; SR-1).
+        unknown = [a.tf for a in cfg.anchors
+                   if tf_key(a.tf) not in self.rank_of and tf_key(a.tf) != k1]
+        if unknown:
+            raise ValueError(f"rank_of: unmapped timeframe(s) {unknown} - extend the ladder")
         self.tf2 = Tf2Structure(cfg)
         self.setup = SetupEngine(cfg, mintick, k1, self.rank_of)
         self.tf2_index = {}
@@ -138,10 +143,13 @@ class RinoEngine:
                          and (r.state == 0 or (r.changed_at is not None
                                                and r.changed_at >= episode_origin)))
 
-        for a in self.cfg.anchors:
+# V3.2 parity (S-6): executed f_v3PriorityDir scans TF1 FIRST, then A3, A2, A1
+        # (slot = 3 - layerIdx). Old A1,A2,A3,TF1 was the pre-S-6 reading.
+        layers.append(PriorityLayer(True, k1, draws_for(k1)))
+        for a in reversed(self.cfg.anchors):
             layers.append(PriorityLayer(enabled=a.enabled and tf_key(a.tf) != k1,
                                         tf_key=tf_key(a.tf), draws=draws_for(tf_key(a.tf))))
-        layers.append(PriorityLayer(True, k1, draws_for(k1)))
+
         return layers
 
     # ------------------------------------------------------------------ ADD-01 raid
