@@ -24,6 +24,6 @@ for sym in SYMBOLS:
     eng = RinoEngine(cfg, pip_size(sym) / 10)
     eng.run(load(sym))
     st = pd.DataFrame(eng.setup.all_setups())
-    st.to_csv(f"reports/setups_m2_{sym}.csv", index=False)
+    st.to_csv(f"reports/setups_m2_{sym}.csv", index=False, float_format="%.17g")
     print(f"[{sym}] m2 population: {len(st)} setups, {int(st.actionable.sum()) if len(st) else 0} admitted")
 print("\nstamped reports/setups_m2_*.csv - point 12's SETS_PREFIX at them.")

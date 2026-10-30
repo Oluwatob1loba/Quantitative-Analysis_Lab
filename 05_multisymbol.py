@@ -41,9 +41,12 @@ for sym in RUN:
                 gradeA=round(gr.get("A", float("nan")), 3) if "A" in gr.index else None,
                 gradeB=round(gr.get("B", float("nan")), 3) if "B" in gr.index else None)
         out_name = f"reports/trades_{sym}.csv" if mode == "base" else f"reports/trades_{mode}_{sym}.csv"
-        tr.to_csv(out_name, index=False)
+        tr.to_csv(out_name, index=False, float_format="%.17g")   # D-PY-44/49
     rows.append(row)
-    st.to_csv(f"reports/setups_{sym}.csv", index=False)
+    # D-PY-49: exact float64 serialization - pandas default to_csv truncates
+    # (e.g. fl(114.653+0.001) -> "114.654"), which desyncs CSV geometry from the
+    # engine's in-memory values by 1 ulp and manufactures phantom audit defects.
+    st.to_csv(f"reports/setups_{sym}.csv", index=False, float_format="%.17g")
     print(f"[{sym}] done: {rows[-1]}")
 
 ms = pd.DataFrame(rows)

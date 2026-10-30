@@ -30,7 +30,8 @@ for f in SETUP_FILES:
         if len(tr):
             tr_all.append(tr)
     if tr_all:
-        pd.concat(tr_all, ignore_index=True).to_csv(f"reports/trades_m3_{sym}.csv", index=False)
+        pd.concat(tr_all, ignore_index=True).to_csv(f"reports/trades_m3_{sym}.csv",
+                                                    index=False, float_format="%.17g")
     rows.append(row)
     print(f"[{sym}] {row}")
 out = pd.DataFrame(rows)

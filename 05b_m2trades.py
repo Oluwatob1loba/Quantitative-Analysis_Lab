@@ -12,5 +12,5 @@ for sym in SYMBOLS:
         print(f"[{sym}] no m2 stamps - skipped"); continue
     su = pd.read_csv(sp, parse_dates=["origin", "availableAt"])
     tr = run_backtest(load(sym), su, mintick=pip_size(sym) / 10, mode="base")
-    tr.to_csv(f"reports/trades_m2_{sym}.csv", index=False)
+    tr.to_csv(f"reports/trades_m2_{sym}.csv", index=False, float_format="%.17g")
     print(f"[{sym}] {len(tr)} m2 trades stamped (base mode)")
