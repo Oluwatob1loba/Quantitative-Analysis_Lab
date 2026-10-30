@@ -446,12 +446,13 @@ class SetupEngine:
                 self.cfg, direction, entry, ep.origin, tf1_recs, anc_recs, self.rank_of)
             actionable = tgt is not None
             reason = "" if actionable else "no clean PDOL target (TF1 or higher)"
-            # TSM direction gates (live pine) - D-PY-33: bypassed when admission == "m2"
-            if self.cfg.admission == "full":
-                if actionable and self.tsm.dir != 0 and self.tsm.dir != direction:
-                    actionable = False; reason = f"opposes trend (trend {self.tsm.dir} vs dir {direction})"
-                if actionable and self.tsm.dir == 0 and prio != 0 and prio != direction:
-                    actionable = False; reason = f"opposes TF1 draw (prio {prio} vs dir {direction})"
+            # D-PY-39b: TSM demoted from GATE to GUIDANCE (architect ruling 2026-10-29).
+            # Trend opposition stamps caution; it never suppresses. Pine arm: same amendment owed.
+            trend_caution = False
+            if actionable and self.tsm.dir != 0 and self.tsm.dir != direction:
+                trend_caution = True
+            if actionable and self.tsm.dir == 0 and prio != 0 and prio != direction:
+                trend_caution = True
             slice_lo = ep.l if direction == 1 else max(ep.o, ep.c)
             slice_hi = min(ep.o, ep.c) if direction == 1 else ep.h
             pend = [(g.direction, g.lower, g.upper, g.available_at) for g in self.feed.candidates_today()]
@@ -530,7 +531,7 @@ class SetupEngine:
                  "breakClass": "None", "state": "MANIPULATION" if actionable else "CONTEXT",
                  "endTime": None if actionable else ep.boundary,
                  "dualHit": False, "caution": bool(self.tsm.pend_side != 0
-                                                   and self.tsm.pend_side == direction),
+                                                   and self.tsm.pend_side == direction) or trend_caution,
                  "contextReason": reason, "poiDiag": diag, "t1": t1, "t1Flipped": t1_flip,
                  "seriesHigh": series_hi, "seriesLow": series_lo,
                  "seriesStart": tgt_org, "seriesEnd": ep.origin,

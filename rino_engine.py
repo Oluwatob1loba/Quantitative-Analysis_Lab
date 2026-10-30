@@ -91,11 +91,12 @@ class RinoEngine:
         # Admission is DRAW-ANCHORED (D-PY-22): undisturbed covered PDOLs on TF1 AND
         # ACTIVE anchors set the expected direction; the swept side is the opposite one;
         # no undisturbed draw -> no event. Deliberate divergence from frozen C:L2115-2120.
-        active_anchor_keys = {tf_key(a.tf) for a in self.cfg.anchors
-                              if a.enabled and tf_key(a.tf) != k1}
+        # D-PY-39 (architect ruling 2026-10-29): admission draws are TF1 UNDISTURBED
+        # PDOLs ONLY. Anchors do NOT gate setup choice - they exist for confluence
+        # tracking and TSM influence (_priority_layers below), never for admission.
         draws = [r for r in self.dol.records.values()
                  if r.role == "PDOL" and r.state == 0 and r.coverage
-                 and (r.tf_key == k1 or r.tf_key in active_anchor_keys)]
+                 and r.tf_key == k1]
         admit = set()
         for r in draws:
             side = r.owner.kind if hasattr(r.owner, "kind") else r.owner.side

@@ -71,11 +71,42 @@ One line per ruling. Amendments replace the line and cite the date; nothing is d
 - INCIDENT | 05 slowdown (>1h vs ~10min morning run) suspected file drift: rino_setup.py re-saved before the run while Qwen had repo access. PENDING: diff of architect's current rino_setup.py vs certified. Standing order issued: Qwen = REVIEW-ONLY (AGENTS.md executor contract, both directions).
 - TOOL | viz.py (Qwen plotly visualizer) shipped with two fixes: ISO timestamps (Qwen parsed unit='ms' — wrong for our CSVs) + SYMBOL dial. Requires: pip install plotly.
 
-D-PY-29 | Authority precedence codified: conceptual PDFs rank below the frozen system documents; they generate hypotheses, the repo arbitrates. (2026-10-28)
+## D-PY REGISTER 29-41 (append to DECISIONS.md)
 
-D-PY-31 | model files separated per architect (M1=souped-candle-end target, M2=bar-0/quadrant-limits ungated, M3=full gate stack); engine shared, models consume | ratified 2026-10-28
+- D-PY-29 | authority precedence: conceptual PDFs = hypothesis libraries; repo arbitrates (2026-10-28)
+- D-PY-30 | walk-forward execution optimizer ratified (dial space + 2021-23/2024-26 split) (2026-10-28)
+- D-PY-31 | model files separated (M1 souped-candle-end / M2 bar-0+quadrant limits / M3 full gates) (2026-10-28)
+- D-PY-32 | timeframe ladders universal across FX/metals/indices (rino_pairings.py) (2026-10-28)
+- D-PY-33 | admission flag: 'm2' bypasses TSM+POI at record time; 'full' frozen default (2026-10-28)
+- D-PY-34 | V3.2-EXECUTED parity fixes: class prev-candle@completion, pick_target A1-first,
+priority scan TF1->A3->A2->A1 (S-6), TSM stamps, rank_of fail-fast (2026-10-28)
+- D-PY-35 | shared-behavior queue: D-506 two-sided ref, display-fallback swept flags, pending-path L1 -
+Qwen-verified both-arms parity; doctrine questions, not port bugs (2026-10-29)
+- D-PY-36 | viz provider audit = engine's own FvgFeed class, unpruned, exact gate predicates (2026-10-29)
+- D-PY-37 | state/endTime were already exported; redistribution displayed (hover + dimming) (2026-10-29)
+- D-PY-38 | wrong-side fill guard: no trade fills beyond its own target (both engines) (2026-10-29)
+- D-PY-39 | anchors OUT of setup admission: TF1 PDOLs only; anchors = confluence + TSM influence (2026-10-29)
+- D-PY-39b | TSM demoted from hard gate to GUIDANCE: opposition stamps caution, never vetoes (2026-10-29)
+- D-PY-40 | episode kill rule: a close through the episode's ORIGIN extreme kills a pending
+episode (EPISODE_KILLED) - failed soup retires, no zombie aggregation (2026-10-29)
+- D-PY-41 | PRESET_AUDUSD deleted: AUDUSD returns to PRESET_A (1D/H4) - the weekly preset
+explained the entire AUDUSD anomaly arc (2026-10-29)
+D-PY-42 | viz M3 view: outcomes/markers from run_model3 semantics only; M2 view gate-evidence suppressed (2026-10-30)
+D-PY-43 | execution-record stamping (entry/exit bars+prices+times) + independent
+          trade_audit geometric verifier; viz is a pure renderer, recompute banned (2026-10-30)
+D-PY-44 | 05 dual-mode wrote both ledgers to trades_*.csv (d703 clobbered base);
+          06/07/08 inputs were silently d703 - restamp + rerun studies. Fixed:
+          per-mode filenames. trade_audit v2: base-only audit, per-code summary (2026-10-30)
 
-D-PY-32 | timeframe ladders universal across FX/metals/indices (rino_pairings.py).
+D-PY-45 | trade_audit v3-v5: inclusive-bound ordering fix, gap-fill conventions,
+          glob population fix in 09 (was stamping m2 into trades_m3), time-located
+          bar audit + LAKE_DISORDER bucket; all three ledgers verified clean (2026-10-30)
+D-PY-46 | lake disorder quantified per symbol via trade_audit [sym|LAKE] lines;
+          re-export lakes with duplicate/unsorted timestamps before next restamp (2026-10-30)
+D-PY-47 | same-bar T1/T2 convention ratified: partial books, runner needs a later
+          bar (conservative); T2_SAME_BAR optimistic dial queued for the optimizer (2026-10-30)
+D-PY-48 | trade_audit era stamps extended to the lake (data/*_M15.csv); LAKE NEWER THAN
+          LEDGER warning makes stale-lake defects self-diagnosing (2026-10-30)
 
 WE ARE HERE (2026-10-24): all four foundation boards green in the sandbox on a synthetic lake after BUG-PY-05 + TEST-PY-02/03 + D-PY-18; rino_episode.py + test_episode.py delivered (25/25 fixture gates) awaiting orchestrator. NEXT: architect to rule the D-PY-21 open question (re-sweep eligibility). Then rino_setup.py per the LIVE frozen pine AS AMENDED BY D-PY-20 (flat sweeps): targets, F-strict slice POI gate (the 9/25 SDOL-into-FVG case is now admissible and testable), class A/B with grade-B cap, TSM trend gate, ownership, poiDiag export. NOTE: with D-PY-20 ruled, Pine and the port now differ systematically on sweep admission; either Pine gets the same patch or the parity harness is defined against the amended spec (D-PY-20).
 

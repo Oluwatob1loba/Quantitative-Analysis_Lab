@@ -98,6 +98,8 @@ def scan(bars, pos, d, entry, stop, t1, t2, partial, move_be):
     R = abs(entry - stop)
     if not np.isfinite(R) or R == 0:
         return None
+    if d * (t2 - entry) <= 0:
+        return None                    # wrong-side fill: entry beyond own target
     if d == 1:
         sl_at = lo <= stop
         t1_at = (hi >= t1) if t1 is not None else np.zeros(len(hi), bool)

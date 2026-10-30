@@ -9,7 +9,10 @@ from rino_backtest import run_model3
 
 QUADRANTS = (1.0, 0.75, 0.5, 0.25)
 rows = []
-for f in sorted(glob.glob("reports/setups_*.csv")):
+# M3 population only: exclude the D-PY-33 m2 stamps from the glob
+SETUP_FILES = [f for f in sorted(glob.glob("reports/setups_*.csv"))
+               if "_m2_" not in f]
+for f in SETUP_FILES:
     sym = f.split("_")[-1].replace(".csv", "")
     st = pd.read_csv(f, parse_dates=["origin", "availableAt"])
     for col in ("breakAt", "breakCritAt"):        # tolerate pre-stamp CSVs
@@ -19,10 +22,15 @@ for f in sorted(glob.glob("reports/setups_*.csv")):
             st[col] = pd.NaT
     df = load(sym)
     row = {"symbol": sym}
+    tr_all = []
     for q in QUADRANTS:
         tr = run_model3(df, st, quadrant=q, mintick=pip_size(sym) / 10)
         row[f"q{int(q*100)}_n"] = len(tr)
         row[f"q{int(q*100)}_R"] = round(float(tr.pnl_R.mean()), 3) if len(tr) else None
+        if len(tr):
+            tr_all.append(tr)
+    if tr_all:
+        pd.concat(tr_all, ignore_index=True).to_csv(f"reports/trades_m3_{sym}.csv", index=False)
     rows.append(row)
     print(f"[{sym}] {row}")
 out = pd.DataFrame(rows)

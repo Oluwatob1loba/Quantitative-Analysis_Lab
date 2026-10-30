@@ -40,7 +40,8 @@ for sym in RUN:
                 raidF=round(kt.get(False, float("nan")), 3) if False in kt.index else None,
                 gradeA=round(gr.get("A", float("nan")), 3) if "A" in gr.index else None,
                 gradeB=round(gr.get("B", float("nan")), 3) if "B" in gr.index else None)
-        tr.to_csv(f"reports/trades_{sym}.csv", index=False)
+        out_name = f"reports/trades_{sym}.csv" if mode == "base" else f"reports/trades_{mode}_{sym}.csv"
+        tr.to_csv(out_name, index=False)
     rows.append(row)
     st.to_csv(f"reports/setups_{sym}.csv", index=False)
     print(f"[{sym}] done: {rows[-1]}")

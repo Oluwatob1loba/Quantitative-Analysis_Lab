@@ -37,6 +37,12 @@ class _Bars:
         self.close = df["close"].to_numpy(float)
         self.spread = df["spread"].to_numpy(float)
         self.n = len(self.idx)
+        # lake content fingerprint: any re-export/appended bars changes this,
+        # letting trade_audit detect stale ledgers instead of phantom defects.
+        self.fp = (f"{self.n}|{int(self.idx[0])}|{int(self.idx[-1])}|"
+                   f"{float(np.nansum(self.close[::997])):.4f}|"
+                   f"{float(np.nansum(self.high[::997])):.4f}|"
+                   f"{float(np.nansum(self.low[::997])):.4f}")
 
     def pos_at(self, ts):
         """First bar whose timestamp is >= ts (mirrors df.loc[df.index >= ts])."""
@@ -53,6 +59,7 @@ def run_backtest(df, setups, partial=PARTIAL, mintick=MINTICK, mode="base"):
                   Rationale: 08 showed non-Critical setups average ~-0.5R."""
     bars = _Bars(df)
     n = bars.n
+    skipped_wrong_side = 0
     has_crit = "breakCritAt" in setups.columns
     trades = []
     for _, s in setups.iterrows():
@@ -67,6 +74,9 @@ def run_backtest(df, setups, partial=PARTIAL, mintick=MINTICK, mode="base"):
         R = abs(entry - float(s.stop))
         if not np.isfinite(R) or R == 0:
             continue
+        if d * (float(s.target) - entry) <= 0:
+            skipped_wrong_side += 1            # entry beyond own target: limit-entry-only case
+            continue
         stop = float(s.stop)
         t1 = float(s.t1) if np.isfinite(s.t1) else None
         t2 = float(s.target)
@@ -76,6 +86,7 @@ def run_backtest(df, setups, partial=PARTIAL, mintick=MINTICK, mode="base"):
         crit_ns = crit_at.value if crit_at is not None else None
         t1_done = False; pnl = 0.0; reason = "OPEN"; t1_pos = -1
         i = pos
+        xi, xpx = pos, entry          # stamped execution record (audit + viz)
         while i < n:
             crit = crit_ns is not None and bars.idx_i[i] >= crit_ns
             h = bars.high[i]; l = bars.low[i]; c = bars.close[i]
@@ -85,8 +96,12 @@ def run_backtest(df, setups, partial=PARTIAL, mintick=MINTICK, mode="base"):
             if hit_sl:
                 pnl += ((stop - entry) if not t1_done else (1 - partial) * (stop - entry)) * d / R
                 reason = "BE" if (t1_done and abs(stop - entry) < 1e-12) else "SL"
+                xi, xpx = i, stop
                 break
             if hit_t1:
+                # SAME-BAR CONVENTION (D-PY-47 candidate): if this bar's range also
+                # spans T2, the runner's target is NOT booked here - intrabar order
+                # is unknowable, so the runner needs a LATER bar (conservative).
                 pnl += partial * (t1 - entry) * d / R
                 t1_done = True; t1_pos = i
                 if MOVE_BE_AFTER_T1 or (mode == "d703" and crit):
@@ -98,18 +113,24 @@ def run_backtest(df, setups, partial=PARTIAL, mintick=MINTICK, mode="base"):
                     i += 1                          # no confirmed spark: don't honor the far target
                     continue
                 pnl += (1 if not t1_done else (1 - partial)) * (t2 - entry) * d / R
-                reason = "T2"; break
+                reason = "T2"; xi, xpx = i, t2; break
             if mode == "d703" and t1_done and not crit and t1_pos >= 0 and i > t1_pos:
                 pnl += (1 - partial) * (c - entry) * d / R
-                reason = "NOCRIT"; break
+                reason = "NOCRIT"; xi, xpx = i, float(c); break
             i += 1
         else:
             pnl += ((1 - partial) if t1_done else 1.0) * (float(bars.close[n - 1]) - entry) * d / R
-            reason = "EOD"
+            reason = "EOD"; xi, xpx = n - 1, float(bars.close[n - 1])
         trades.append(dict(origin=s.origin, direction=d, grade=s.grade, mode=mode,
                            setupClass=s.setupClass, keyTimeSweep=bool(s.keyTimeSweep),
                            targetTf=s.targetTf, R=R, pnl_R=pnl, reason=reason,
-                           t1=t1_done, confluenceLayers=s.confluenceLayers))
+                           t1=t1_done, confluenceLayers=s.confluenceLayers,
+                           entry_i=pos, entry_px=entry, entry_time=pd.Timestamp(bars.idx[pos]),
+                           exit_i=xi, exit_px=xpx, exit_time=pd.Timestamp(bars.idx[xi]),
+                           lake_fp=bars.fp))
+    if skipped_wrong_side:
+        print(f"  guard: skipped {skipped_wrong_side} trades whose bar-0 fill opened "
+              f"beyond their own target (limit-entry-only setups, not losses)")
     return pd.DataFrame(trades)
 
 
@@ -194,6 +215,7 @@ def run_model3(df, setups, quadrant=1.0, mintick=MINTICK, partial=PARTIAL,
         t2 = float(s.target)
         t1_done = False; pnl = 0.0; reason = "OPEN"
         i = fill_pos
+        xi, xpx = fill_pos, entry
         while i < n:
             h = bars.high[i]; l = bars.low[i]; c = bars.close[i]
             hit_sl = (l <= stop) if d == 1 else (h >= stop)
@@ -202,8 +224,10 @@ def run_model3(df, setups, quadrant=1.0, mintick=MINTICK, partial=PARTIAL,
             if hit_sl:
                 pnl += ((stop - entry) if not t1_done else (1 - partial) * (stop - entry)) * d / R
                 reason = "BE" if (t1_done and abs(stop - entry) < 1e-12) else "SL"
+                xi, xpx = i, stop
                 break
             if hit_t1:
+                # SAME-BAR CONVENTION: T2 within this bar is not booked (see base loop).
                 pnl += partial * (t1 - entry) * d / R
                 t1_done = True
                 if MOVE_BE_AFTER_T1:
@@ -212,13 +236,17 @@ def run_model3(df, setups, quadrant=1.0, mintick=MINTICK, partial=PARTIAL,
                 continue
             if hit_t2:
                 pnl += (1 if not t1_done else (1 - partial)) * (t2 - entry) * d / R
-                reason = "T2"
+                reason = "T2"; xi, xpx = i, t2
                 break
             i += 1
         else:
             pnl += ((1 - partial) if t1_done else 1.0) * (float(bars.close[n - 1]) - entry) * d / R
-            reason = "EOD"
+            reason = "EOD"; xi, xpx = n - 1, float(bars.close[n - 1])
         trades.append(dict(origin=s.origin, direction=d, grade=s.grade, model="m3",
                            quadrant=quadrant, breakClass=s.breakClass,
-                           pnl_R=pnl, reason=reason, t1=t1_done))
+                           pnl_R=pnl, reason=reason, t1=t1_done, R=R,
+                           entry_i=fill_pos, entry_px=entry,
+                           entry_time=pd.Timestamp(bars.idx[fill_pos]),
+                           exit_i=xi, exit_px=xpx, exit_time=pd.Timestamp(bars.idx[xi]),
+                           lake_fp=bars.fp))
     return pd.DataFrame(trades)

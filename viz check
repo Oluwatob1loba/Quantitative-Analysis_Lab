@@ -1,0 +1,5 @@
+import os, pandas as pd
+for f in ["reports/setups_EURUSD.csv", "reports/rino_chart.html"]:
+    print(f, pd.Timestamp(os.path.getmtime(f), unit="s"))
+st = pd.read_csv("reports/setups_EURUSD.csv", parse_dates=["origin", "availableAt"])
+print(st[st.actionable == True].targetTf.value_counts())

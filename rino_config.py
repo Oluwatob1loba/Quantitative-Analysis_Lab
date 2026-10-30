@@ -112,15 +112,10 @@ PRESET_A = RinoConfig(
     name="PRESET_A_unattributed",
     tf1="1D", tf1_lookback=15, tf1_sub_lookback=13, tf2="4h",
     anchors=[AnchorCfg("1W", 5, True, True), AnchorCfg("1M", 5, True, True),
-             AnchorCfg("3M", 3, True, False)],
+             AnchorCfg("3M", 3, False, False)],   # D-PY-41: anchor 3 OFF (architect)
 )
-PRESET_AUDUSD = RinoConfig(
-    name="AUDUSD",
-    tf1="1W", tf1_lookback=8, tf1_sub_lookback=8, tf2="1D",
-    anchors=[AnchorCfg("1W", 5, False, False), AnchorCfg("1M", 5, True, True),
-             AnchorCfg("3M", 3, True, False)],
-)
-PRESETS = {p.name: p for p in (PRESET_A, PRESET_AUDUSD)}
+
+PRESETS = {p.name: p for p in (PRESET_A,)}
 
 
 def config_for(symbol: str) -> RinoConfig:

@@ -19,8 +19,8 @@ from rino_config import config_for
 from rino_engine import RinoEngine
 from rino_dol import tf_key
 
-DAY = pd.Timestamp("2026-08-13")
-SYMBOL = "EURUSD"
+DAY = pd.Timestamp("2026-09-14")
+SYMBOL = "AUDUSD"
 PAD = pd.Timedelta(days=5)
 
 cfg = config_for(SYMBOL)

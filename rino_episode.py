@@ -32,6 +32,8 @@ STANDING RULINGS
   D-PY-15  no bias/CHoCH anywhere in this module.
   D-PY-17  attribution (candle OPEN) and detection (candle CLOSE-END) are
            distinct stamps on every emitted event.
+  D-PY-40  a close through the episode's ORIGIN extreme kills a pending
+           episode (EPISODE_KILLED) before aggregation - failed soup retires.
 """
 
 from dataclasses import dataclass, field
@@ -83,6 +85,8 @@ class Episode:
     l: float
     c: float
     boundary: int                          # last aggregated candle CLOSE-END
+    origin_low: float = 0.0                # D-PY-40: opening candle's own low (kill ref)
+    origin_high: float = 0.0               # D-PY-40: opening candle's own high (kill ref)
     candles: int = 1
     swept_high: bool = False
     swept_low: bool = False
@@ -218,6 +222,7 @@ class EpisodeMachine:
                 range_low=min(lows) if lows else candle.l,
                 origin=candle.origin,
                 o=candle.o, h=candle.h, l=candle.l, c=candle.c,
+                origin_low=candle.l, origin_high=candle.h,
                 boundary=candle.boundary,
                 candles=1,
                 swept_high=bool(highs),
@@ -234,6 +239,16 @@ class EpisodeMachine:
 
         # -- aggregation (C:L2134) -------------------------------------------
         else:
+            # D-PY-40 (architect ruling 2026-10-29): a close through the episode's
+            # ORIGIN extreme kills a pending episode - the soup has failed and no
+            # close-reference crossing can resurrect it. Checked BEFORE aggregation.
+            if (ep.swept_low and candle.c < ep.origin_low) or \
+               (ep.swept_high and candle.c > ep.origin_high):
+                self._emit("EPISODE_KILLED", ep.origin, candle.boundary,
+                           candles=ep.candles, c=candle.c,
+                           origin_low=ep.origin_low, origin_high=ep.origin_high)
+                self.pending = None
+                return []
             ep.h = max(ep.h, candle.h)
             ep.l = min(ep.l, candle.l)
             ep.c = candle.c
