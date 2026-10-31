@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 from lab import load, pip_size
 
-VERSION = "v7.5"
+VERSION = "v7.6"
 PARTIAL = 0.6        # rino_backtest module default (D-PY-23 dial)
 NEED = {"entry_i", "entry_px", "exit_i", "exit_px", "entry_time", "exit_time",
         "R", "pnl_R", "reason", "t1"}
@@ -51,10 +51,11 @@ def audit_symbol(sym, tr_path, st_path, kind="m3g"):
     df = load(sym)
     if not df.index.is_monotonic_increasing:
         df = df.sort_index()
-    fp_cur = (f"{len(df)}|{int(df.index[0].value)}|{int(df.index[-1].value)}|"
-              f"{float(np.nansum(df['close'].to_numpy()[::997])):.4f}|"
-              f"{float(np.nansum(df['high'].to_numpy()[::997])):.4f}|"
-              f"{float(np.nansum(df['low'].to_numpy()[::997])):.4f}")
+    import hashlib as _hl
+    _ih = _hl.md5(np.ascontiguousarray(df.index.values.view("int64")).tobytes()).hexdigest()[:12]
+    fp_cur = (f"{len(df)}|{_ih}|{float(np.nansum(df['close'].to_numpy())):.4f}|"
+              f"{float(np.nansum(df['high'].to_numpy())):.4f}|"
+              f"{float(np.nansum(df['low'].to_numpy())):.4f}")
     if "lake_fp" in tr.columns and len(tr) and str(tr.lake_fp.iloc[0]) != fp_cur:
         return [], [f"!!! STALE LEDGER: lake drifted since these trades were stamped "
                     f"(fp {tr.lake_fp.iloc[0]} vs current {fp_cur}). Every 'defect' here would "

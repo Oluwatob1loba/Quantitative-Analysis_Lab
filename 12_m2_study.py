@@ -39,9 +39,11 @@ MODES = ["bar0", "limits"]
 QUADRANTS = [1.0, 0.75, 0.5, 0.25]        # entry fraction from TIP toward body
 CLASS_MIN = None                          # e.g. "A" -> only A/A+; None = all
 RAID_ONLY = False
+MIN_BREAK = "Major"                          # e.g. "Critical" -> the break-class gate alone
+                                          # (Qwen true-sequence-minus-gates test, D-PY-51)
 PARTIAL, MOVE_BE = 0.6, True
 FILL_MAX_DAYS = 5                         # skip limit fills older than this
-SETS_PREFIX = 'setups_'                   # 'setups_m2_' for the D-PY-33 raw population
+SETS_PREFIX = 'setups_m2_'                   # 'setups_m2_' for the D-PY-33 raw population
 
 _spec = importlib.util.spec_from_file_location("opt", "10_optimize.py")
 _opt = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_opt)
@@ -70,6 +72,8 @@ def sim_symbol(sym):
         su = su[su.setupClass.isin({"A": ("A", "A+"), "B": ("B",)}[CLASS_MIN])]
     if RAID_ONLY:
         su = su[su.keyTimeSweep == True]
+    if MIN_BREAK:
+        su = su[su.breakClass == MIN_BREAK]
     if not len(su):
         return None
     mintick = pip_size(sym) / 10
@@ -127,6 +131,7 @@ def sim_symbol(sym):
 
 def main():
     print(f"M2 baseline | CLASS_MIN={CLASS_MIN} RAID_ONLY={RAID_ONLY} "
+          f"MIN_BREAK={MIN_BREAK} "
           f"PARTIAL={PARTIAL} BE={MOVE_BE} FILL_MAX_DAYS={FILL_MAX_DAYS} "
           f"| split {SPLIT_AT:%Y-%m-%d}")
     print("cells = test exp / train exp (trades) | p0 = wick tip ... p75 = toward body\n")

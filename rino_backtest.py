@@ -39,10 +39,10 @@ class _Bars:
         self.n = len(self.idx)
         # lake content fingerprint: any re-export/appended bars changes this,
         # letting trade_audit detect stale ledgers instead of phantom defects.
-        self.fp = (f"{self.n}|{int(self.idx[0])}|{int(self.idx[-1])}|"
-                   f"{float(np.nansum(self.close[::997])):.4f}|"
-                   f"{float(np.nansum(self.high[::997])):.4f}|"
-                   f"{float(np.nansum(self.low[::997])):.4f}")
+        import hashlib as _hl
+        _ih = _hl.md5(np.ascontiguousarray(self.idx_i).tobytes()).hexdigest()[:12]
+        self.fp = (f"{self.n}|{_ih}|{float(np.nansum(self.close)):.4f}|"
+                   f"{float(np.nansum(self.high)):.4f}|{float(np.nansum(self.low)):.4f}")
 
     def pos_at(self, ts):
         """First bar whose timestamp is >= ts (mirrors df.loc[df.index >= ts])."""

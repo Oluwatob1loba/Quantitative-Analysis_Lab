@@ -32,15 +32,15 @@ import plotly.graph_objects as go
 from lab import load
 
 # ---------------- dials ----------------
-SYMBOL = "AUDUSD"      # which symbol's setups to draw
+SYMBOL = "EURUSD"      # which symbol's setups to draw
 PRICE_TF = "1D"        # candle size for the price backdrop ("1h"/"4h"/"1D")
 WINDOW_DAYS = 60       # length of the time window (slide it from the browser)
 START_AT = None        # "YYYY-MM-DD" to center the window elsewhere, None = latest data
 SHOW_CONTEXT = True    # True = also draw CONTEXT records (faded)
 SETS_PREFIX = "setups_"  # "setups_m2_" to view the raw Model-2 population (D-PY-33)
-LEDGER = "base"             # which STAMPED ledger to draw: base (05) | m3 (09) | m2 auto
+LEDGER = "m3"             # which STAMPED ledger to draw: base (05) | m3 (09) | m2 auto
 TRADE_MODE = "base"         # within the base ledger: base | d703
-EXEC_Q = 0.75              # within the m3 ledger: quadrant to draw
+EXEC_Q = 0.5              # within the m3 ledger: quadrant to draw
 # --------------------------------------
 
 setups_path = f"reports/{SETS_PREFIX}{SYMBOL}.csv"
